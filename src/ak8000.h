@@ -7,13 +7,15 @@
 // ─────────────────────────────────────────────────────────────
 //  Asahi Kasei AK8000  —  Audio/Video Processor
 //
-//  The AK8000 almost certainly decodes MPEG-1 video + MPEG audio
-//  (MPEG-1 decoder chips were standard in 1994 FMV hardware).
-//  We use libavcodec for actual decoding and scan incoming CD
-//  sectors for MPEG-1 start codes.
+//  The AK8000 uses a proprietary video codec (NOT standard MPEG-1).
+//  Video frames are assembled from 6 × F1 sectors (12282 bytes)
+//  with a 40-byte header and DCT-based compression.
 //
-//  Video: MPEG-1, 320×240 @ ~30fps → RGB888 framebuffer
-//  Audio: MPEG-1 Layer II, 44100Hz stereo → int16 ring buffer
+//  Video: 256×144, 4:2:0, ~15fps, MPEG-1 DC VLC with DPCM
+//         (AC coefficient coding not yet reverse-engineered)
+//  Audio: CD-ROM XA ADPCM (decoded in hardware path)
+//
+//  The libavcodec path is kept for potential MPEG-PS/VCD content.
 // ─────────────────────────────────────────────────────────────
 
 // AK8000 register offsets (I/O mapped at 0x6000+)
@@ -88,6 +90,7 @@ typedef struct AK8000 {
     // ── Playdia video state ───────────────────────────────────
     uint8_t  qtable[16];             // 4×4 quantization table
     uint8_t  qscale;                 // quantization scale factor
+    int      dc_pred[3];             // DC DPCM predictors (Y, Cb, Cr)
 } AK8000;
 
 // ── API ───────────────────────────────────────────────────────

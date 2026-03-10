@@ -24,7 +24,9 @@
 
 // Number of CD sectors to read per video frame
 // 75 sectors/s ÷ 30 fps = 2.5 → we do 3 per frame
-#define PIPE_SECTORS_PER_FRAME  3
+// Playdia FMV needs ~10 sectors per video frame at ~15fps
+// At emulator's 30fps, read 10 sectors/frame = 300 sectors/sec ≈ 4× CD speed
+#define PIPE_SECTORS_PER_FRAME  10
 
 // How many decoded audio samples to drain per frame
 // (1470 stereo pairs = one full frame of 44100/30)

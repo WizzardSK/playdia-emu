@@ -242,88 +242,169 @@ void ak8000_tick(AK8000 *v) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Playdia Proprietary Video Decoder
+//  Playdia Proprietary Video Decoder (DC-only, AC not yet decoded)
 //
-//  Frame format (assembled from F1 sectors):
-//    Bytes 0-1:  00 80 — frame marker
-//    Byte 2:     block size indicator (always 0x04 = 4×4 blocks)
-//    Byte 3:     quantization scale
-//    Bytes 4-19: 16-entry quantization table (4×4 DCT coefficients)
-//    Bytes 20-35: repeat of qtable (redundancy)
-//    Bytes 36+:  compressed bitstream (VLC-coded 4×4 blocks)
+//  Frame format (assembled from 6 × F1 sectors, 12282 bytes):
+//    Bytes 0-2:   00 80 04 — frame marker
+//    Byte 3:      quantization scale (QS)
+//    Bytes 4-19:  16-byte quantization table
+//    Bytes 20-35: repeat of qtable
+//    Bytes 36-38: 00 80 24
+//    Byte 39:     frame type (0=I, 1=P, etc.)
+//    Bytes 40+:   bitstream (MPEG-1 luminance DC VLC with DPCM,
+//                 followed by AC data in unknown format)
 //
-//  Output: 256×192 image rendered into 320×240 framebuffer
-//  (centered/scaled with borders)
-//
-//  NOTE: This is a best-effort decode. The exact bitstream format
-//  is not fully reverse-engineered. We use a simplified approach:
-//  interpret the data as 2-bit-per-pixel blocks with qtable as
-//  luminance palette, producing a grayscale approximation.
+//  Resolution: 256×144, 4:2:0, 16×9 macroblocks = 864 blocks
+//  Currently decodes DC coefficients only (produces blocky but
+//  recognizable color images).
 // ─────────────────────────────────────────────────────────────
 
-// Playdia native resolution (256×192 or similar, within 320×240 output)
 #define PD_W  256
-#define PD_H  192
+#define PD_H  144
+
+// MPEG-1 luminance DC VLC table (size 0-11)
+static const struct { int len; uint32_t code; } pd_dc_vlc[] = {
+    {3,0x4}, {2,0x0}, {2,0x1}, {3,0x5}, {3,0x6},
+    {4,0xE}, {5,0x1E}, {6,0x3E}, {7,0x7E},
+    {8,0xFE}, {9,0x1FE}, {10,0x3FE}
+};
+
+static int pd_get_bit(const uint8_t *d, int bp) {
+    return (d[bp >> 3] >> (7 - (bp & 7))) & 1;
+}
+
+static uint32_t pd_get_bits(const uint8_t *d, int bp, int n) {
+    uint32_t v = 0;
+    for (int i = 0; i < n; i++)
+        v = (v << 1) | pd_get_bit(d, bp + i);
+    return v;
+}
+
+// Decode one DC VLC value, return bits consumed or -1 on error
+static int pd_dec_dc(const uint8_t *d, int bp, int *val, int total_bits) {
+    for (int i = 0; i < 12; i++) {
+        if (bp + pd_dc_vlc[i].len > total_bits) continue;
+        uint32_t b = pd_get_bits(d, bp, pd_dc_vlc[i].len);
+        if (b == pd_dc_vlc[i].code) {
+            int sz = i, c = pd_dc_vlc[i].len;
+            if (sz == 0) {
+                *val = 0;
+            } else {
+                if (bp + c + sz > total_bits) return -1;
+                uint32_t r = pd_get_bits(d, bp + c, sz);
+                c += sz;
+                *val = (r < (1u << (sz - 1)))
+                     ? (int)r - (1 << sz) + 1
+                     : (int)r;
+            }
+            return c;
+        }
+    }
+    return -1;
+}
+
+static int pd_clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
 static void playdia_decode_video_frame(AK8000 *v) {
-    if (v->vid_frame_pos < 36) return; // too short
+    if (v->vid_frame_pos < 40) return;
 
-    // Parse header
-    uint8_t block_type = v->vid_frame_buf[2];
-    uint8_t qscale     = v->vid_frame_buf[3];
-    (void)block_type;
+    const uint8_t *f = v->vid_frame_buf;
 
-    // Extract quantization table (16 entries)
-    memcpy(v->qtable, v->vid_frame_buf + 4, 16);
+    // Validate header
+    if (f[0] != 0x00 || f[1] != 0x80 || f[2] != 0x04) return;
+
+    uint8_t qscale = f[3];
+    uint8_t frame_type = f[39];
+    memcpy(v->qtable, f + 4, 16);
     v->qscale = qscale;
 
-    // Bitstream starts at offset 36
-    const uint8_t *bs = v->vid_frame_buf + 36;
-    int bs_len = v->vid_frame_pos - 36;
+    // Find actual data end (strip 0xFF padding)
+    int data_end = v->vid_frame_pos;
+    while (data_end > 40 && f[data_end - 1] == 0xFF) data_end--;
+    int total_bits = data_end * 8;
 
-    // Simple decode: treat each byte as 4 pixels (2 bits each)
-    // Map 2-bit index to luminance using qtable values as palette
-    // qtable values range ~10-37, scale to 0-255
-    uint8_t palette[4];
-    // Use qtable entries 0,5,10,15 (diagonal) as representative luminances
-    for (int i = 0; i < 4; i++) {
-        int idx = i * 5; // 0, 5, 10, 15
-        if (idx >= 16) idx = 15;
-        int lum = v->qtable[idx] * 255 / 40;
-        if (lum > 255) lum = 255;
-        palette[i] = (uint8_t)lum;
+    // Reset DC predictors on I-frames
+    if (frame_type == 0) {
+        v->dc_pred[0] = v->dc_pred[1] = v->dc_pred[2] = 0;
     }
 
-    // Decode pixels row by row into a temporary buffer
-    uint8_t pixels[PD_W * PD_H];
-    memset(pixels, 0, sizeof(pixels));
+    // Decode DC for all 864 blocks (144 macroblocks × 6 blocks)
+    // Block order per MB: Y0, Y1, Y2, Y3, Cb, Cr
+    int bp = 40 * 8;
+    int dc_vals[864];
+    int decoded = 0;
 
-    int byte_idx = 0;
-    for (int y = 0; y < PD_H && byte_idx < bs_len; y++) {
-        for (int x = 0; x < PD_W && byte_idx < bs_len; x += 4) {
-            uint8_t b = bs[byte_idx++];
-            // 4 pixels per byte, 2 bits each (MSB first)
-            for (int p = 0; p < 4 && (x + p) < PD_W; p++) {
-                int idx = (b >> (6 - p * 2)) & 0x03;
-                pixels[y * PD_W + x + p] = palette[idx];
-            }
+    for (int mb = 0; mb < 144 && bp < total_bits; mb++) {
+        for (int bl = 0; bl < 6 && bp < total_bits; bl++) {
+            int comp = (bl < 4) ? 0 : (bl == 4) ? 1 : 2;
+            int diff;
+            int used = pd_dec_dc(f, bp, &diff, total_bits);
+            if (used < 0) goto dc_done;
+            v->dc_pred[comp] += diff;
+            dc_vals[decoded] = v->dc_pred[comp];
+            decoded++;
+            bp += used;
+        }
+    }
+dc_done:
+
+    // Build DC-only image: each 8×8 block gets a flat color from DC
+    // DC value scaling: multiply by 8 and add 128 for level shift
+    uint8_t Y[PD_H][PD_W];
+    uint8_t Cb[PD_H / 2][PD_W / 2];
+    uint8_t Cr[PD_H / 2][PD_W / 2];
+    memset(Y, 128, sizeof(Y));
+    memset(Cb, 128, sizeof(Cb));
+    memset(Cr, 128, sizeof(Cr));
+
+    for (int i = 0; i < decoded; i++) {
+        int mb = i / 6;
+        int bl = i % 6;
+        int mx = mb % 16; // macroblock column (0-15)
+        int my = mb / 16; // macroblock row (0-8)
+        int pixel_val = pd_clamp(dc_vals[i] * 8 + 128);
+
+        if (bl < 4) {
+            // Luma block: 8×8 within 16×16 macroblock
+            int bx = mx * 16 + (bl & 1) * 8;
+            int by = my * 16 + (bl >> 1) * 8;
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++)
+                    if (by + y < PD_H && bx + x < PD_W)
+                        Y[by + y][bx + x] = (uint8_t)pixel_val;
+        } else if (bl == 4) {
+            // Cb block: 8×8 covers 16×16 macroblock area
+            int bx = mx * 8;
+            int by = my * 8;
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++)
+                    if (by + y < PD_H / 2 && bx + x < PD_W / 2)
+                        Cb[by + y][bx + x] = (uint8_t)pixel_val;
+        } else {
+            // Cr block
+            int bx = mx * 8;
+            int by = my * 8;
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++)
+                    if (by + y < PD_H / 2 && bx + x < PD_W / 2)
+                        Cr[by + y][bx + x] = (uint8_t)pixel_val;
         }
     }
 
-    // Render into 320×240 RGB888 framebuffer (centered)
+    // YCbCr → RGB888 into framebuffer (centered in 320×240)
     int ox = (SCREEN_W - PD_W) / 2;  // 32
-    int oy = (SCREEN_H - PD_H) / 2;  // 24
-
-    // Clear borders to black
+    int oy = (SCREEN_H - PD_H) / 2;  // 48
     memset(v->framebuffer, 0, SCREEN_W * SCREEN_H * 3);
 
     for (int y = 0; y < PD_H; y++) {
         for (int x = 0; x < PD_W; x++) {
-            uint8_t lum = pixels[y * PD_W + x];
+            int yv = Y[y][x];
+            int cb = Cb[y / 2][x / 2] - 128;
+            int cr = Cr[y / 2][x / 2] - 128;
             int dst = ((y + oy) * SCREEN_W + (x + ox)) * 3;
-            v->framebuffer[dst + 0] = lum;
-            v->framebuffer[dst + 1] = lum;
-            v->framebuffer[dst + 2] = lum;
+            v->framebuffer[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
+            v->framebuffer[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
+            v->framebuffer[dst + 2] = (uint8_t)pd_clamp(yv + (int)(1.772 * cb));
         }
     }
 
@@ -462,18 +543,20 @@ void ak8000_feed_xa_sector(AK8000 *v, const uint8_t *raw_sector) {
         if (marker == 0xF1) {
             // Video data sector — append to frame buffer
             int copy = 2047; // skip marker byte
-            if (v->vid_frame_pos + copy > (int)sizeof(v->vid_frame_buf))
-                copy = (int)sizeof(v->vid_frame_buf) - v->vid_frame_pos;
-            if (copy > 0) {
+            if (v->vid_frame_pos + copy <= (int)sizeof(v->vid_frame_buf)) {
                 memcpy(v->vid_frame_buf + v->vid_frame_pos, payload + 1, copy);
                 v->vid_frame_pos += copy;
             }
         } else if (marker == 0xF2) {
             // Frame end marker — decode the assembled video frame
-            if (v->vid_frame_pos > 0) {
+            if (v->vid_frame_pos >= 6 * 2047 &&
+                v->vid_frame_buf[0] == 0x00 &&
+                v->vid_frame_buf[1] == 0x80 &&
+                v->vid_frame_buf[2] == 0x04) {
+                v->vid_frame_pos = 6 * 2047;
                 playdia_decode_video_frame(v);
-                v->vid_frame_pos = 0;
             }
+            v->vid_frame_pos = 0;
         } else if (marker == 0xF3) {
             // Scene marker — reset frame accumulator
             v->vid_frame_pos = 0;

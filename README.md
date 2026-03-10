@@ -13,14 +13,16 @@
   - `[0-3]`: `00 80 04 QS` — QS = quantizer scale (observed: 7–40)
   - `[4-19]`: 16-byte quantization table (always `0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`)
   - `[20-35]`: **identical copy** of qtable (always same as [4-19])
-  - `[36-39]`: `00 80 24 TYPE` — TYPE: 00=I-frame, 01=P-frame
+  - `[36-39]`: `00 80 24 TYPE` — TYPE: 00=I-frame, 01=P-frame, plus types 2, 3, 5, 6, 31, 237 found across multiple games
 - **Bitstream**: bytes 40+ (12242 bytes = 97936 bits)
 - Some frames have 0xFF padding at end; most are 98–100% real data
+- All frames naturally align to byte boundary before padding
+- Ultra-sparse padded frames exist (e.g., Ie Naki Ko: 5052 bytes 0xFF padding, only 62.35 bits/block for AC)
 
-## DC Coefficient Decoding (confirmed)
+## DC Coefficient Decoding (PARTIALLY CONFIRMED — see caveats)
 
-### MPEG-1 DC Luminance VLC (extended)
-DC differences are coded using MPEG-1 Table B.12 (DC luminance), **extended to size 11**:
+### MPEG-1 Luminance DC VLC
+DC differences appear to decode using MPEG-1 Table B.12 (DC luminance):
 ```
 Code         Size  Value range       Total bits
 100          0     0                 3
@@ -36,10 +38,18 @@ Code         Size  Value range       Total bits
 111111110    10    ±512..±1023       19
 1111111110   11    ±1024..±2047      21
 ```
-- DC uses **DPCM**: separate predictors for Y, Cb, Cr components
-- DC uses ~3800-4400 bits per frame (~4.2% of bitstream)
-- Average ~4.8 bits per DC coefficient
-- Sizes 9-11 are used in frames with high contrast (needed for full decode)
+
+**IMPORTANT CAVEAT**: Random position test shows MPEG-1 DC VLC decodes from
+86% of arbitrary starting positions in real data, and 21% from random data.
+The 100% success from position 40×8 may be coincidental. The VLC table is
+nearly self-calibrating for this data. The true DC coding scheme is uncertain.
+
+- With DPCM: Y predictors diverge to [-1114..+42] after 864 blocks (unreasonable)
+- Without DPCM: values are small differentials [-214..+61] (flat gray image)
+- Lum VLC for Y + Chr VLC for CbCr produces best-looking output with DPCM + scale=1
+- Row-reset DPCM (per macroblock row) prevents extreme divergence
+- DC uses ~3800-4100 bits per frame (~3.9-4.2% of bitstream)
+- Average ~4.5 bits per DC coefficient
 
 ### Image Layout (confirmed)
 - **Resolution**: 256×144 pixels (16×9 macroblocks)
@@ -49,12 +59,15 @@ Code         Size  Value range       Total bits
 - **Y sub-block order**: TL, TR, BL, BR within each 16×16 macroblock
 - **IDCT**: standard 8×8 DCT with DC×8 scaling, pixel = IDCT + 128
 
-### DC-Only Images
-DC-only decode (zeroing all AC) produces **recognizable color video frames** across all 3 games:
-- Scene content clearly visible (landscapes, characters, objects)
-- Standard BT.601 YCbCr→RGB conversion works
-- DC DPCM accumulates slight error over the frame (bottom rows drift)
-- Per-MB DC reset gives range [-248, 223] (acceptable for 8-bit)
+### DC-Only Images — Current Status
+Multiple DC decode modes tested on Dragon Ball Z first frame:
+- **Lum/Chr DPCM scale=1**: green gradient (most structure, Y diverges)
+- **Row-reset DPCM**: prevents divergence, shows horizontal color bands
+- **No DPCM (absolute)**: scattered colored dots on gray
+- **Fixed 8-bit per block**: random noise
+
+No mode produces a clearly recognizable image yet. The DC coding scheme
+is not definitively confirmed — the MPEG-1 VLC match may be coincidental.
 
 ## AC Coefficient Coding: UNSOLVED
 
@@ -163,16 +176,74 @@ the same decoder. If they are similar → the scheme is self-calibrating (wrong)
 - Scheme D (00=zero, 01=EOB, 1+Nbit=val): ~12–17% consumed
 - Scheme C (0=zero, 1+DC_VLC, size=0=EOB): 28% with errors
 
+#### LSB-first bit reading
+- Tested systematically — MSB-first confirmed for DC VLC
+- **RULED OUT**
+
+#### MPEG-2 Table B.15 intra AC VLC
+- 12–17% consumption, 600–750 errors per frame, 30%+ error rate
+- Both B.15 and MPEG-1 B.14 definitively **RULED OUT**
+
+#### Count + Position + Value scheme
+- Self-calibrating — produces duplicate positions and unreasonably large values
+- **RULED OUT**
+
+#### CBP (Coded Block Pattern)
+- Multiple variants tested (per-macroblock, per-block), none achieve ~100% consumption
+- **RULED OUT**
+
+#### Systematic prefix code testing
+- 25+ prefix code structures tested (all permutations of 1–3 bit prefixes for zero/nonzero/EOB)
+- None reach 85% consumption on unpadded frames
+- **RULED OUT**
+
+#### Run-level coding with fixed bits
+- Run=2–6 bits, level=DC VLC. Best results: run=4bit ~62%, run=3bit ~60%
+- None reach 100% without self-calibrating
+- **RULED OUT**
+
+#### Fixed (run_bits, size_bits) + magnitude
+- r2+s4 and r3+s4 appeared to reach 100% with "all DC first, then all AC" structure
+- BUT r3+s4 self-calibrates on random data (864 blocks from random)
+- r2+s4 fails on non-padded frames with interleaved DC+AC (684/864 blocks)
+- Generated images produce pure noise — **RULED OUT**
+
+#### Other schemes tested
+- Unary coding: 6.9% — **RULED OUT**
+- Exp-Golomb: 1.2%–11.6% — **RULED OUT**
+- Rice k=0–3: 7.8%–65.7% — **RULED OUT**
+- MB-level coded flag: 17% — **RULED OUT**
+- Block-level coded flag: 15.9% — **RULED OUT**
+
+#### Fixed 96-bit block budget
+- AC bits mod 96 varies wildly across frames (33, 35, 16, 41, 34, 11, 39, 41, 75, 60)
+- **RULED OUT**
+
+### 16-Entry Quantization Table Hypothesis
+The qtable has exactly 16 entries. This suggests **only 16 AC coefficients** (lowest
+frequencies in zigzag order) may be coded per block. With DC, that's 17 values/block:
+- 864 blocks × 17 values × ~6.67 bits/value = 97936 bits ≈ payload size (exact match!)
+- Fixed 7-bit per coefficient (17×7=119 bits/block) gives 99.9% bit consumption
+- **BUT**: all fixed-width approaches produce noise images — the coding is variable-length
+
+### Fixed-Width AC Coding: RULED OUT
+Tested DC (7-9 bits) + 16 AC (5-8 bits) fixed-width signed coefficients with IDCT:
+- 7+7 = 119 bits/block: 99.9% consumption but pure noise image
+- 8+7 = 120 bits/block: slightly over budget
+- All three modes tested (interleaved, all-DC-first, unsigned): all produce noise
+- **The bit count match is coincidental — true coding is variable-length**
+
 ### Remaining hypotheses
 1. **AK8000 is a custom ASIC** — ~50% of Asahi Kasei's IC sales were custom-designed.
    No datasheet, no patents found. No one has previously reverse-engineered this codec.
+   Web search confirmed: NO existing Playdia emulation, no AK8000 documentation anywhere online.
 2. **Arithmetic/range coding** — explains high entropy, but rare in 1994 hardware
 3. **Proprietary VLC table** stored in AK8000 ROM — impossible to determine without decap
 4. **Golomb-Rice k=6 (truncated)** — would produce codes with unary prefix up to 6 bits
    + 6-bit fixed suffix = 12 max length, matching the run-length fingerprint
 5. **Non-standard coefficient ordering** — maybe not zigzag but some other scan order
-6. **Block-level structure** — fixed bit budget per block or macroblock with internal coding
-7. **Separate coding for different frequency bands** — different scheme for low vs high AC
+6. **Separate coding for different frequency bands** — different scheme for low vs high AC
+7. **Only 16 AC coefficients coded** — qtable size matches, but coding scheme unknown
 
 ## Test Games
 | Game | Video LBAs | Notes |
@@ -180,8 +251,10 @@ the same decoder. If they are similar → the scheme is self-calibrating (wrong)
 | `Mari-nee no Heya (Japan).zip` | 277, 502, 757, 1112, 1872, 3072, 5232 | Primary test game |
 | `Yumi to Tokoton Playdia (Japan).zip` | 502+ | Second game, same codec |
 | `Bandai Item Collection 70' (Japan).zip` | 150, 205, 235+ | Third game, confirmed same codec |
+| `Dragon Ball Z - Shin Saiyajin Zetsumetsu Keikaku (Japan).zip` | — | Fourth game, same qtable |
+| `Ie Naki Ko (Japan).zip` | — | Ultra-sparse padded frames found |
 
-All three games share identical qtable values and frame header format.
+All games share identical qtable values and frame header format — qtable is likely hardcoded in the AK8000 chip.
 
 ## Tools Created
 | File | Purpose | Key Finding |
@@ -210,14 +283,35 @@ All three games share identical qtable values and frame header format.
 | `vcodec_dcvlc_ac.c` | DC luminance VLC for AC coefficients | Self-calibrates on random |
 | `vcodec_flagval.c` | 1-bit flag + fixed/VLC value models | All consume 100%, uniform |
 | `vcodec_eob.c` | Flag+value with EOB, Golomb-Rice, Exp-Golomb | GR(0,2) shows real≠random |
+| `vcodec_lsb_boundary.c` | LSB/MSB test, padded frame boundary analysis | MSB-first confirmed, byte-aligned padding |
+| `vcodec_sparse.c` | Ultra-sparse frame analysis | Ie Naki Ko: 5052 bytes padding, 62.35 bits/block |
+| `vcodec_dcvlc_image.c` | DC VLC per-coefficient image generation | DC-only images validated |
+| `vcodec_countpos.c` | Count + position + value AC coding test | Self-calibrating → ruled out |
+| `vcodec_mpeg2intra.c` | MPEG-2 Table B.15 and MPEG-1 B.14 test | 12–17% consumption, 30%+ errors |
+| `vcodec_cbp2.c` | CBP and interleaved DC/AC hypotheses | No variant reaches ~100% |
+| `vcodec_prefix.c` | Systematic prefix code structure testing | 25+ structures, none reach 85% |
+| `vcodec_prefix2.c` | Extended prefix + interleaved testing | Same results as prefix.c |
+| `vcodec_runsize.c` | JPEG-style (run, size) AC coding test | run=4bit ~62%, run=3bit ~60% |
+| `vcodec_rs_image.c` | Run-size candidate validation + image generation | r2+s4/r3+s4 produce noise → ruled out |
 | *(older tools)* | Various earlier approaches | See git history |
 
+## Emulator Status
+The emulator (`playdia`) builds and runs with:
+- **CPU emulation**: TLCS-870 main CPU + NEC 78K/0 I/O CPU
+- **CD-ROM**: CUE/BIN disc loading, raw Mode 2/2352 sector reading
+- **BIOS HLE**: Auto-scans for first F1 video sector (typically LBA 150)
+- **Video pipeline**: F1/F2/F3 sector assembly, DC-only frame decode
+- **Audio**: XA ADPCM decoding to ring buffer, SDL2 audio output
+- **Display**: SDL2 window at 320×240, 256×144 video centered
+- **Frame decode**: DC-only (blocky) — AC coefficients not yet decoded
+- **Rate**: 10 sectors/frame @ 30fps (4× CD speed), ~212 frames in 300 emulator frames
+
 ## Key Insights
-1. **DC coding is MPEG-1 luminance VLC with DPCM** — confirmed, produces recognizable images
+1. **DC coding may use MPEG-1 luminance VLC** — but random position test shows 86% success rate, so this could be coincidental
 2. **Resolution is 256×144** at 4:2:0 (16×9 macroblocks, 864 blocks)
 3. **Both qtable copies in header are always identical** — purpose of duplication unknown
-4. **Frame types**: 00 = intra (I-frame), 01 = inter (P-frame); P-frames have small DC diffs
-5. **Qtable is constant across all 3 games** — likely hardcoded in AK8000
+4. **Frame types**: 0=I-frame, 1=P-frame, plus types 2, 3, 5, 6, 31, 237 found across games
+5. **Qtable is constant across ALL games tested** (Mari-nee, DBZ, Ie Naki Ko) — likely hardcoded in AK8000
 6. **AC coding is NOT any standard VLC** — JPEG, MPEG-1, exp-Golomb all ruled out
 7. **Self-calibration trap**: ANY variable-length code applied to random data produces
    plausible-looking statistics. Always compare real vs random data before concluding.
@@ -225,17 +319,20 @@ All three games share identical qtable values and frame header format.
 9. **QS values observed**: 4, 7, 8, 10, 11, 12, 13, 14, 20, 23, 26, 36, 37, 39, 40
 10. **Run-length fingerprint is the best structural clue** — max run=12, r6/r12 anomalies
     suggest a coding scheme with ~6-bit maximum codeword component
-11. **AK8000 is a custom ASIC** — no documentation exists anywhere, confirmed via web search
+11. **AK8000 is a custom ASIC** — no documentation exists anywhere, no patents, no existing emulation
 12. **Padded frames provide ground truth** — exact data boundaries known from 0xFF padding
+13. **MSB-first bit reading confirmed** — LSB-first tested and ruled out
+14. **DC-only video decoder implemented** in `ak8000.c` with MPEG-1 luminance DC VLC, DPCM, 4:2:0 YCbCr→RGB, 256x144
+15. **No fixed block budget** — AC bits mod 96 varies wildly across frames
 
 ## Open Questions
 1. **What is the AC coding model?** The bitstream after DC is high-entropy with a distinctive
-   run-length fingerprint (max run=12, r6/r12 anomalies). Remaining hypotheses: arithmetic
-   coding, proprietary VLC table in AK8000 ROM, or Golomb-Rice variant with k≈6.
+   run-length fingerprint (max run=12, r6/r12 anomalies). Every standard and semi-standard
+   scheme has been ruled out. Remaining hypotheses: arithmetic coding, proprietary VLC table
+   in AK8000 ROM, or Golomb-Rice variant with k≈6. May require chip decap to solve.
 2. **What role does the qtable play?** DC-only works without dequantization. The qtable may
    control AC quantization step sizes but the AC coding must be solved first.
-3. **Is there inter-frame data in I-frames?** VLC+EOB uses 25%, but 75% of real data remains.
-   Could the extra data be prediction/motion data for subsequent P-frames?
-4. **LSB-first bit reading?** Not yet tested — some hardware reads bits from LSB of each byte.
-5. **Different coding for chroma vs luma AC?** The AK8000 might use separate coding tables.
-6. **Non-zigzag scan order?** Coefficient positions might use a proprietary scan pattern.
+3. **What are frame types 2, 3, 5, 6, 31, 237?** Beyond I-frames (0) and P-frames (1),
+   multiple other types exist with unknown semantics.
+4. **Different coding for chroma vs luma AC?** The AK8000 might use separate coding tables.
+5. **Non-zigzag scan order?** Coefficient positions might use a proprietary scan pattern.

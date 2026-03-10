@@ -298,8 +298,47 @@ static void hle_boot(Playdia *p) {
     }
 
     if (!entry) {
-        printf("[BIOS HLE] No loadable file found — halting\n");
-        p->cpu.halted = true;
+        // ── Playdia fallback: no filesystem, stream raw sectors ────
+        // Playdia discs have no ISO 9660. Scan for first F1 video sector.
+        printf("[BIOS HLE] No filesystem found — scanning for Playdia video...\n");
+        uint32_t start_lba = 0;
+        for (uint32_t lba = 0; lba < 1000 && lba < p->cdrom.total_sectors; lba++) {
+            if (cdrom_seek(&p->cdrom, lba) != 0) break;
+            if (cdrom_read_sector(&p->cdrom) != 0) break;
+            uint8_t sm = p->cdrom.sector_buf[18]; // submode
+            uint8_t mk = p->cdrom.sector_buf[24]; // marker
+            if ((sm & 0x08) && mk == 0xF1) {
+                start_lba = lba;
+                printf("[BIOS HLE] Found first F1 sector at LBA %u\n", lba);
+                break;
+            }
+        }
+        if (start_lba == 0) {
+            // Try scanning from LBA 100 (some discs have large headers)
+            for (uint32_t lba = 100; lba < 2000 && lba < p->cdrom.total_sectors; lba++) {
+                if (cdrom_seek(&p->cdrom, lba) != 0) break;
+                if (cdrom_read_sector(&p->cdrom) != 0) break;
+                if (p->cdrom.sector_buf[24] == 0xF1) {
+                    start_lba = lba;
+                    printf("[BIOS HLE] Found F1 sector at LBA %u (marker-only match)\n", lba);
+                    break;
+                }
+            }
+        }
+        printf("[BIOS HLE] Starting raw sector stream from LBA %u\n", start_lba);
+        cdrom_seek(&p->cdrom, start_lba);
+        p->cdrom.streaming = true;
+        p->cdrom.stream_end = 0; // unlimited
+
+        // Install FMV playback loop stub
+        uint16_t stub_addr = GAME_LOAD_ADDR + 0x1000; // 0x3000
+        uint8_t *s = p->mem + stub_addr;
+        *s++ = 0xCD; *s++ = HLE_ADDR_VSYNC & 0xFF; *s++ = HLE_ADDR_VSYNC >> 8;
+        *s++ = 0xCD; *s++ = HLE_ADDR_CTRL  & 0xFF; *s++ = HLE_ADDR_CTRL  >> 8;
+        *s++ = 0xC3; *s++ = stub_addr & 0xFF; *s++ = stub_addr >> 8;
+
+        p->cpu.PC = stub_addr;
+        printf("[BIOS HLE] FMV playback loop at 0x%04X\n", stub_addr);
         return;
     }
 

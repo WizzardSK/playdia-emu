@@ -1,1 +1,30 @@
 tools/test_output/
+output/
+
+# Build artifacts
+*.o
+playdia
+test_full
+
+# Test/diagnostic binaries and output
+dump_frame
+dump_diag
+dump_dc
+dump_dc_modes
+dump_dc_v2
+dc_detail
+dc_eob
+dc_abs
+dc_ac16
+dc_ac_try2
+analyze_raw
+extract_frame
+vlc_random
+*.ppm
+*.pgm
+*.png
+frame*.bin
+
+# Tool binaries (source in tools/*.c is tracked)
+tools/vcodec_*
+!tools/vcodec_*.c

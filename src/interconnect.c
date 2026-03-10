@@ -17,21 +17,9 @@ void interconnect_sector_cb(void *ctx) {
     if (len > 0x7FFF) len = 0x7FFF;
     memcpy(p->mem + 0x8000, p->cdrom.data_ptr, len);
 
-    // 2. Route sector through pipeline using Playdia XA path
-    //    Playdia uses XA sectors (not MPEG-PS), so route via subheader
-    if (p->cdrom.raw_mode && p->cdrom.data_ptr) {
-        uint8_t submode = p->cdrom.sector_buf[18];
-        uint8_t marker  = p->cdrom.sector_buf[24]; // first payload byte
-
-        // XA Audio (submode bit 2)
-        if (submode & 0x04) {
-            ak8000_feed_xa_sector(&p->video, p->cdrom.sector_buf);
-        }
-        // Playdia video (F1/F2/F3 markers on DATA sectors)
-        else if ((submode & 0x08) && (marker == 0xF1 || marker == 0xF2 || marker == 0xF3)) {
-            ak8000_feed_xa_sector(&p->video, p->cdrom.sector_buf);
-        }
-    }
+    // 2. AK8000 routing is handled by pipeline_run_frame / route_sector.
+    //    Do NOT feed here to avoid double-feeding (the callback fires on
+    //    every cdrom_read_sector including boot scan reads).
 
     // 3. Update mailbox: STATUS = READY, store sector length
     p->mem[MAILBOX_BASE + MBOX_STATUS]    = MSTAT_READY;
