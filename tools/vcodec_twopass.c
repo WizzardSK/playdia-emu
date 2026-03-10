@@ -1,0 +1,529 @@
+/*
+ * vcodec_twopass.c - Test two-pass VLC hypothesis
+ *
+ * Theory: After first VLC+EOB pass (25% of bits), the remaining 75%
+ * is a second VLC pass continuing from each block's EOB position.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+#include <zip.h>
+
+#define SECTOR_RAW 2352
+#define MAX_FRAME  65536
+#define W 256
+#define H 144
+
+static const struct { int len; uint32_t code; int size; } dc_vlc[] = {
+    {3, 0b100, 0}, {2, 0b00, 1}, {2, 0b01, 2}, {3, 0b101, 3},
+    {3, 0b110, 4}, {4, 0b1110, 5}, {5, 0b11110, 6},
+    {6, 0b111110, 7}, {7, 0b1111110, 8},
+};
+#define DC_VLC_COUNT 9
+
+typedef struct { const uint8_t *data; int total_bits; int pos; } bitstream;
+
+static int bs_read(bitstream *bs, int n) {
+    if (n <= 0 || bs->pos + n > bs->total_bits) return -1;
+    int v = 0;
+    for (int i = 0; i < n; i++) {
+        int bp = bs->pos + i;
+        v = (v << 1) | ((bs->data[bp >> 3] >> (7 - (bp & 7))) & 1);
+    }
+    bs->pos += n;
+    return v;
+}
+
+static int bs_peek(bitstream *bs, int n) {
+    if (n <= 0 || bs->pos + n > bs->total_bits) return -1;
+    int v = 0;
+    for (int i = 0; i < n; i++) {
+        int bp = bs->pos + i;
+        v = (v << 1) | ((bs->data[bp >> 3] >> (7 - (bp & 7))) & 1);
+    }
+    return v;
+}
+
+static int read_dc_vlc(bitstream *bs) {
+    for (int i = 0; i < DC_VLC_COUNT; i++) {
+        int bits = bs_peek(bs, dc_vlc[i].len);
+        if (bits == (int)dc_vlc[i].code) {
+            bs->pos += dc_vlc[i].len;
+            int sz = dc_vlc[i].size;
+            if (sz == 0) return 0;
+            int val = bs_read(bs, sz);
+            if (val < (1 << (sz - 1))) val -= (1 << sz) - 1;
+            return val;
+        }
+    }
+    bs->pos += 2;
+    return 0;
+}
+
+typedef struct { uint32_t code; int len; int run; int level; } ac_entry;
+static const ac_entry ac_table[] = {
+    {0b11, 2, 0, 1}, {0b011, 3, 1, 1}, {0b0100, 4, 0, 2}, {0b0101, 4, 2, 1},
+    {0b00101, 5, 0, 3}, {0b00110, 5, 4, 1}, {0b00111, 5, 3, 1},
+    {0b000100, 6, 7, 1}, {0b000101, 6, 6, 1}, {0b000110, 6, 1, 2}, {0b000111, 6, 5, 1},
+    {0b0000100, 7, 2, 2}, {0b0000101, 7, 9, 1}, {0b0000110, 7, 0, 4}, {0b0000111, 7, 8, 1},
+    {0b00100000, 8, 13, 1}, {0b00100001, 8, 0, 6}, {0b00100010, 8, 12, 1},
+    {0b00100011, 8, 11, 1}, {0b00100100, 8, 3, 2}, {0b00100101, 8, 1, 3},
+    {0b00100110, 8, 0, 5}, {0b00100111, 8, 10, 1},
+    {0b0000001000, 10, 16, 1}, {0b0000001001, 10, 5, 2}, {0b0000001010, 10, 0, 7},
+    {0b0000001011, 10, 2, 3}, {0b0000001100, 10, 1, 4}, {0b0000001101, 10, 15, 1},
+    {0b0000001110, 10, 14, 1}, {0b0000001111, 10, 4, 2},
+    {0b000000010000, 12, 0, 11}, {0b000000010001, 12, 8, 2}, {0b000000010010, 12, 4, 3},
+    {0b000000010011, 12, 0, 10}, {0b000000010100, 12, 2, 4}, {0b000000010101, 12, 7, 2},
+    {0b000000010110, 12, 21, 1}, {0b000000010111, 12, 20, 1}, {0b000000011000, 12, 0, 9},
+    {0b000000011001, 12, 19, 1}, {0b000000011010, 12, 18, 1}, {0b000000011011, 12, 1, 5},
+    {0b000000011100, 12, 3, 3}, {0b000000011101, 12, 0, 8}, {0b000000011110, 12, 6, 2},
+    {0b000000011111, 12, 17, 1},
+    {0b0000000010000, 13, 10, 2}, {0b0000000010001, 13, 9, 2}, {0b0000000010010, 13, 5, 3},
+    {0b0000000010011, 13, 3, 4}, {0b0000000010100, 13, 2, 5}, {0b0000000010101, 13, 1, 7},
+    {0b0000000010110, 13, 1, 6}, {0b0000000010111, 13, 0, 15}, {0b0000000011000, 13, 0, 14},
+    {0b0000000011001, 13, 0, 13}, {0b0000000011010, 13, 0, 12}, {0b0000000011011, 13, 26, 1},
+    {0b0000000011100, 13, 25, 1}, {0b0000000011101, 13, 24, 1}, {0b0000000011110, 13, 23, 1},
+    {0b0000000011111, 13, 22, 1},
+    {0b00000000010000, 14, 0, 31}, {0b00000000010001, 14, 0, 30}, {0b00000000010010, 14, 0, 29},
+    {0b00000000010011, 14, 0, 28}, {0b00000000010100, 14, 0, 27}, {0b00000000010101, 14, 0, 26},
+    {0b00000000010110, 14, 0, 25}, {0b00000000010111, 14, 0, 24}, {0b00000000011000, 14, 0, 23},
+    {0b00000000011001, 14, 0, 22}, {0b00000000011010, 14, 0, 21}, {0b00000000011011, 14, 0, 20},
+    {0b00000000011100, 14, 0, 19}, {0b00000000011101, 14, 0, 18}, {0b00000000011110, 14, 0, 17},
+    {0b00000000011111, 14, 0, 16},
+    {0b000000000010000, 15, 0, 40}, {0b000000000010001, 15, 0, 39}, {0b000000000010010, 15, 0, 38},
+    {0b000000000010011, 15, 0, 37}, {0b000000000010100, 15, 0, 36}, {0b000000000010101, 15, 0, 35},
+    {0b000000000010110, 15, 0, 34}, {0b000000000010111, 15, 0, 33}, {0b000000000011000, 15, 0, 32},
+    {0b000000000011001, 15, 1, 14}, {0b000000000011010, 15, 1, 13}, {0b000000000011011, 15, 1, 12},
+    {0b000000000011100, 15, 1, 11}, {0b000000000011101, 15, 1, 10}, {0b000000000011110, 15, 1, 9},
+    {0b000000000011111, 15, 1, 8},
+    {0b0000000000010000, 16, 1, 18}, {0b0000000000010001, 16, 1, 17}, {0b0000000000010010, 16, 1, 16},
+    {0b0000000000010011, 16, 1, 15}, {0b0000000000010100, 16, 6, 3}, {0b0000000000010101, 16, 16, 2},
+    {0b0000000000010110, 16, 15, 2}, {0b0000000000010111, 16, 14, 2}, {0b0000000000011000, 16, 13, 2},
+    {0b0000000000011001, 16, 12, 2}, {0b0000000000011010, 16, 11, 2}, {0b0000000000011011, 16, 31, 1},
+    {0b0000000000011100, 16, 30, 1}, {0b0000000000011101, 16, 29, 1}, {0b0000000000011110, 16, 28, 1},
+    {0b0000000000011111, 16, 27, 1},
+};
+#define AC_TABLE_SIZE 111
+
+static int decode_ac(bitstream *bs, int *run, int *level) {
+    if (bs->pos + 2 > bs->total_bits) return -1;
+    if (bs_peek(bs, 2) == 0b10) { bs->pos += 2; return 0; }
+    if (bs->pos + 6 <= bs->total_bits && bs_peek(bs, 6) == 0b000001) {
+        bs->pos += 6;
+        *run = bs_read(bs, 6);
+        int raw = bs_read(bs, 10);
+        *level = (raw >= 512) ? raw - 1024 : raw;
+        return 1;
+    }
+    for (int i = 0; i < AC_TABLE_SIZE; i++) {
+        if (bs->pos + ac_table[i].len + 1 > bs->total_bits) continue;
+        if (bs_peek(bs, ac_table[i].len) == (int)ac_table[i].code) {
+            bs->pos += ac_table[i].len;
+            int sign = bs_read(bs, 1);
+            *run = ac_table[i].run;
+            *level = ac_table[i].level;
+            if (sign) *level = -(*level);
+            return 1;
+        }
+    }
+    return -1;
+}
+
+static const int zigzag[64] = {
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63
+};
+
+static int assemble_frames(const uint8_t *disc, int tsec, int slba,
+    uint8_t fr[][MAX_FRAME], int fs[], int mx) {
+    int n=0,c=0; bool inf=false;
+    for(int l=slba;l<tsec&&n<mx;l++){
+        const uint8_t *s=disc+(long)l*SECTOR_RAW;
+        if(s[0]!=0||s[1]!=0xFF||s[15]!=2||(s[18]&4)) continue;
+        if(s[24]==0xF1){if(!inf){inf=true;c=0;}if(c+2047<MAX_FRAME){memcpy(fr[n]+c,s+25,2047);c+=2047;}}
+        else if(s[24]==0xF2){if(inf&&c>0){fs[n]=c;n++;inf=false;c=0;}}
+    } return n;
+}
+
+static void idct8x8(int block[64], int out[64]) {
+    double tmp[64];
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++) {
+            double sum = 0;
+            for (int u = 0; u < 8; u++) {
+                double cu = (u == 0) ? 1.0/sqrt(2.0) : 1.0;
+                sum += cu * block[i*8+u] * cos((2*j+1)*u*M_PI/16.0);
+            }
+            tmp[i*8+j] = sum * 0.5;
+        }
+    for (int j = 0; j < 8; j++)
+        for (int i = 0; i < 8; i++) {
+            double sum = 0;
+            for (int v = 0; v < 8; v++) {
+                double cv = (v == 0) ? 1.0/sqrt(2.0) : 1.0;
+                sum += cv * tmp[v*8+j] * cos((2*i+1)*v*M_PI/16.0);
+            }
+            out[i*8+j] = (int)(sum * 0.5);
+        }
+}
+
+static int clamp(int v) { return v<0?0:v>255?255:v; }
+static void write_ppm(const char *fn, uint8_t *img, int w, int h) {
+    FILE *f = fopen(fn, "wb");
+    fprintf(f, "P5\n%d %d\n255\n", w, h);
+    fwrite(img, 1, w*h, f);
+    fclose(f);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) return 1;
+    int start_lba = atoi(argv[2]);
+
+    int err; zip_t *z = zip_open(argv[1], ZIP_RDONLY, &err); if (!z) return 1;
+    int bi2=-1; zip_uint64_t bs2=0;
+    for (int i=0; i<(int)zip_get_num_entries(z,0); i++) {
+        zip_stat_t st; if(zip_stat_index(z,i,0,&st)==0 && st.size>bs2){bs2=st.size;bi2=i;}}
+    zip_stat_t st; zip_stat_index(z,bi2,0,&st);
+    zip_file_t *zf = zip_fopen_index(z,bi2,0);
+    uint8_t *disc = malloc(st.size);
+    zip_int64_t rd=0;
+    while(rd<(zip_int64_t)st.size){zip_int64_t r=zip_fread(zf,disc+rd,st.size-rd);if(r<=0)break;rd+=r;}
+    zip_fclose(zf);
+    int tsec = (int)(st.size/SECTOR_RAW);
+
+    static uint8_t frames[8][MAX_FRAME]; int fsizes[8];
+    int nf = assemble_frames(disc, tsec, start_lba, frames, fsizes, 8);
+    if (nf == 0) { printf("No frames\n"); return 1; }
+
+    uint8_t *f = frames[0];
+    int fsize = fsizes[0];
+    int qs = f[3], type = f[39];
+    const uint8_t *bsdata = f + 40;
+    int bslen = fsize - 40;
+    int total_bits = bslen * 8;
+    int mw = W/16, mh = H/16, nblocks = mw*mh*6;
+
+    printf("LBA %d: qs=%d type=%d fsize=%d nblocks=%d\n", start_lba, qs, type, fsize, nblocks);
+
+    /* Find real data length */
+    int last_nonff = bslen - 1;
+    while (last_nonff >= 0 && bsdata[last_nonff] == 0xFF) last_nonff--;
+    int real_bits = (last_nonff + 1) * 8;
+    printf("Real data: %d bytes = %d bits\n\n", last_nonff+1, real_bits);
+
+    static int blocks[900][64];
+    int eob_pos[900]; /* zigzag position where EOB was hit for each block */
+
+    /* ===== PASS 1: DC + AC VLC with EOB ===== */
+    printf("=== PASS 1: DC + VLC + EOB ===\n");
+    memset(blocks, 0, sizeof(blocks));
+    {
+        bitstream bs = {bsdata, total_bits, 0};
+        int dc_pred[3] = {0,0,0};
+        int eobs = 0, nz = 0;
+
+        for (int b = 0; b < nblocks && bs.pos < total_bits; b++) {
+            int comp = (b%6 < 4) ? 0 : (b%6 == 4) ? 1 : 2;
+            int diff = read_dc_vlc(&bs);
+            dc_pred[comp] += diff;
+            blocks[b][0] = dc_pred[comp] * 8;
+
+            int pos = 1;
+            while (pos < 64 && bs.pos < total_bits) {
+                int run, level;
+                int ret = decode_ac(&bs, &run, &level);
+                if (ret == 0) { eobs++; eob_pos[b] = pos; break; }
+                if (ret == -1) { eob_pos[b] = pos; bs.pos++; break; }
+                pos += run;
+                if (pos >= 64) break;
+                blocks[b][zigzag[pos]] = level; /* raw level, dequant later */
+                nz++;
+                pos++;
+            }
+            if (pos >= 64) eob_pos[b] = 64;
+        }
+        printf("  bits=%d/%d (%.1f%%), eobs=%d, nz=%d\n",
+               bs.pos, total_bits, 100.0*bs.pos/total_bits, eobs, nz);
+
+        int pass1_end = bs.pos;
+
+        /* ===== PASS 2A: Continue VLC+EOB from each block's EOB position ===== */
+        printf("\n=== PASS 2A: Second VLC+EOB pass (continue from EOB) ===\n");
+        {
+            int eobs2 = 0, nz2 = 0, errs2 = 0;
+            for (int b = 0; b < nblocks && bs.pos < total_bits; b++) {
+                int pos = eob_pos[b];
+                if (pos >= 64) continue;
+
+                while (pos < 64 && bs.pos < total_bits) {
+                    int run, level;
+                    int ret = decode_ac(&bs, &run, &level);
+                    if (ret == 0) { eobs2++; break; }
+                    if (ret == -1) { errs2++; bs.pos++; break; }
+                    pos += run;
+                    if (pos >= 64) break;
+                    blocks[b][zigzag[pos]] += level; /* add to existing */
+                    nz2++;
+                    pos++;
+                }
+            }
+            printf("  pass2 bits=%d (total=%d/%d = %.1f%%)\n",
+                   bs.pos - pass1_end, bs.pos, total_bits, 100.0*bs.pos/total_bits);
+            printf("  eobs2=%d, nz2=%d, errs2=%d\n", eobs2, nz2, errs2);
+        }
+
+        /* ===== PASS 2B: Another full VLC+EOB pass for all blocks ===== */
+        printf("\n=== PASS 2B: Second full VLC+EOB pass (all 64 positions) ===\n");
+        /* Reset to pass1 end */
+        bs.pos = pass1_end;
+        {
+            int eobs2 = 0, nz2 = 0, errs2 = 0;
+            for (int b = 0; b < nblocks && bs.pos < total_bits; b++) {
+                int pos = 1; /* start from AC[1] again */
+                while (pos < 64 && bs.pos < total_bits) {
+                    int run, level;
+                    int ret = decode_ac(&bs, &run, &level);
+                    if (ret == 0) { eobs2++; break; }
+                    if (ret == -1) { errs2++; bs.pos++; break; }
+                    pos += run;
+                    if (pos >= 64) break;
+                    nz2++;
+                    pos++;
+                }
+            }
+            printf("  pass2b bits=%d (total=%d/%d = %.1f%%)\n",
+                   bs.pos - pass1_end, bs.pos, total_bits, 100.0*bs.pos/total_bits);
+            printf("  eobs2=%d, nz2=%d, errs2=%d\n", eobs2, nz2, errs2);
+        }
+
+        /* ===== PASS 2C: No EOB VLC for remaining positions ===== */
+        printf("\n=== PASS 2C: Flag+VLC for remaining AC positions ===\n");
+        bs.pos = pass1_end;
+        {
+            int nz2 = 0, zero2 = 0;
+            for (int b = 0; b < nblocks && bs.pos < total_bits; b++) {
+                for (int pos = eob_pos[b]; pos < 64 && bs.pos < total_bits; pos++) {
+                    int flag = bs_read(&bs, 1);
+                    if (flag == 1) {
+                        /* non-zero: read sign + magnitude */
+                        int sign = bs_read(&bs, 1);
+                        /* simple unary for magnitude */
+                        int mag = 1;
+                        while (bs.pos < total_bits && bs_read(&bs, 1) == 1) mag++;
+                        blocks[b][zigzag[pos]] += sign ? -mag : mag;
+                        nz2++;
+                    } else {
+                        zero2++;
+                    }
+                }
+            }
+            printf("  flag+vlc bits=%d (total=%d/%d = %.1f%%)\n",
+                   bs.pos - pass1_end, bs.pos, total_bits, 100.0*bs.pos/total_bits);
+            printf("  nz2=%d, zero2=%d (%.1f%% zero)\n", nz2, zero2,
+                   100.0*zero2/(nz2+zero2));
+        }
+
+        /* ===== TEST: What if blocks are coded in 4 separate Y,Y,Y,Y,Cb,Cr passes? ===== */
+        printf("\n=== TEST: Separate component passes ===\n");
+        bs.pos = 0;
+        {
+            int dc_p[3] = {0,0,0};
+            /* Pass Y: decode only luma blocks (4 per MB) */
+            int y_blocks = mw * mh * 4;
+            int y_eobs = 0, y_nz = 0;
+            for (int mb = 0; mb < mw*mh && bs.pos < total_bits; mb++) {
+                for (int s = 0; s < 4 && bs.pos < total_bits; s++) {
+                    int diff = read_dc_vlc(&bs);
+                    dc_p[0] += diff;
+                    int pos = 1;
+                    while (pos < 64 && bs.pos < total_bits) {
+                        int run, level;
+                        int ret = decode_ac(&bs, &run, &level);
+                        if (ret == 0) { y_eobs++; break; }
+                        if (ret == -1) { bs.pos++; break; }
+                        pos += run;
+                        if (pos >= 64) break;
+                        y_nz++;
+                        pos++;
+                    }
+                }
+            }
+            int y_end = bs.pos;
+            printf("  Y pass: %d bits (%.1f%%), eobs=%d, nz=%d\n",
+                   y_end, 100.0*y_end/total_bits, y_eobs, y_nz);
+
+            /* Pass Cb */
+            int cb_eobs = 0, cb_nz = 0;
+            dc_p[1] = 0;
+            for (int mb = 0; mb < mw*mh && bs.pos < total_bits; mb++) {
+                int diff = read_dc_vlc(&bs);
+                dc_p[1] += diff;
+                int pos = 1;
+                while (pos < 64 && bs.pos < total_bits) {
+                    int run, level;
+                    int ret = decode_ac(&bs, &run, &level);
+                    if (ret == 0) { cb_eobs++; break; }
+                    if (ret == -1) { bs.pos++; break; }
+                    pos += run;
+                    if (pos >= 64) break;
+                    cb_nz++;
+                    pos++;
+                }
+            }
+            int cb_end = bs.pos;
+            printf("  Cb pass: %d bits (%.1f%% cumul), eobs=%d, nz=%d\n",
+                   cb_end - y_end, 100.0*cb_end/total_bits, cb_eobs, cb_nz);
+
+            /* Pass Cr */
+            int cr_eobs = 0, cr_nz = 0;
+            dc_p[2] = 0;
+            for (int mb = 0; mb < mw*mh && bs.pos < total_bits; mb++) {
+                int diff = read_dc_vlc(&bs);
+                dc_p[2] += diff;
+                int pos = 1;
+                while (pos < 64 && bs.pos < total_bits) {
+                    int run, level;
+                    int ret = decode_ac(&bs, &run, &level);
+                    if (ret == 0) { cr_eobs++; break; }
+                    if (ret == -1) { bs.pos++; break; }
+                    pos += run;
+                    if (pos >= 64) break;
+                    cr_nz++;
+                    pos++;
+                }
+            }
+            int cr_end = bs.pos;
+            printf("  Cr pass: %d bits (%.1f%% cumul), eobs=%d, nz=%d\n",
+                   cr_end - cb_end, 100.0*cr_end/total_bits, cr_eobs, cr_nz);
+            printf("  DC pred: Y=%d, Cb=%d, Cr=%d\n", dc_p[0], dc_p[1], dc_p[2]);
+        }
+
+        /* ===== TEST: What if it's ALL DC with no AC at all, but more blocks? ===== */
+        printf("\n=== TEST: DC-only for various block counts ===\n");
+        for (int nb = 576; nb <= 5760; nb += 576) {
+            bs.pos = 0;
+            int dc_p = 0;
+            int dc_min = 99999, dc_max = -99999;
+            bool ok = true;
+            for (int b = 0; b < nb && bs.pos < real_bits; b++) {
+                int diff = read_dc_vlc(&bs);
+                if (diff == -1 || diff < -255 || diff > 255) { ok = false; }
+                dc_p += diff;
+                if (dc_p < dc_min) dc_min = dc_p;
+                if (dc_p > dc_max) dc_max = dc_p;
+            }
+            printf("  %d blocks: %d bits (%.1f%%), DC range [%d,%d]%s\n",
+                   nb, bs.pos, 100.0*bs.pos/real_bits, dc_min, dc_max,
+                   ok ? "" : " ERRORS");
+        }
+
+        /* ===== TEST: Band-by-band (all DC, then all AC[1], then all AC[2]...) ===== */
+        printf("\n=== TEST: Band-by-band decode ===\n");
+        bs.pos = 0;
+        {
+            int dc_p[3] = {0,0,0};
+            /* DC for all blocks */
+            for (int b = 0; b < nblocks && bs.pos < total_bits; b++) {
+                int comp = (b%6 < 4) ? 0 : (b%6 == 4) ? 1 : 2;
+                int diff = read_dc_vlc(&bs);
+                dc_p[comp] += diff;
+                blocks[b][0] = dc_p[comp] * 8;
+            }
+            int dc_end = bs.pos;
+            printf("  DC: %d bits (%.1f%%)\n", dc_end, 100.0*dc_end/total_bits);
+
+            /* AC bands: try VLC+EOB for each band */
+            int band_bits[8];
+            int band_nz[8];
+            int band_eobs[8];
+            int cumul = dc_end;
+            for (int band = 0; band < 8 && bs.pos < total_bits; band++) {
+                int start = (band == 0) ? 1 : band * 8;
+                int end = (band == 0) ? 8 : (band + 1) * 8;
+                if (end > 64) end = 64;
+
+                int b_start = bs.pos;
+                band_nz[band] = 0;
+                band_eobs[band] = 0;
+
+                for (int b = 0; b < nblocks && bs.pos < total_bits; b++) {
+                    /* For this band, try VLC+EOB */
+                    int run, level;
+                    int ret = decode_ac(&bs, &run, &level);
+                    if (ret == 0) { band_eobs[band]++; continue; }
+                    if (ret == -1) { bs.pos++; continue; }
+                    band_nz[band]++;
+                    /* Could decode more within this band... */
+                }
+                band_bits[band] = bs.pos - b_start;
+                cumul = bs.pos;
+                printf("  Band %d (pos %d-%d): %d bits, nz=%d, eobs=%d (%.1f%% cumul)\n",
+                       band, start, end-1, band_bits[band], band_nz[band],
+                       band_eobs[band], 100.0*cumul/total_bits);
+            }
+        }
+    }
+
+    /* ===== OUTPUT: Pass 1 image with different dequant ===== */
+    printf("\n=== Output images ===\n");
+    uint8_t *gray = malloc(W * H);
+
+    /* Recalculate blocks with pass 1 only */
+    memset(blocks, 0, sizeof(blocks));
+    {
+        bitstream bs = {bsdata, total_bits, 0};
+        int dc_pred[3] = {0,0,0};
+        for (int b = 0; b < nblocks && bs.pos < total_bits; b++) {
+            int comp = (b%6 < 4) ? 0 : (b%6 == 4) ? 1 : 2;
+            int diff = read_dc_vlc(&bs);
+            dc_pred[comp] += diff;
+            blocks[b][0] = dc_pred[comp] * 8;
+            int pos = 1;
+            while (pos < 64 && bs.pos < total_bits) {
+                int run, level;
+                int ret = decode_ac(&bs, &run, &level);
+                if (ret == 0) break;
+                if (ret == -1) { bs.pos++; break; }
+                pos += run;
+                if (pos >= 64) break;
+                /* Try: level * 2 for AC dequant (since level is small) */
+                blocks[b][zigzag[pos]] = level * 2;
+                pos++;
+            }
+        }
+    }
+
+    /* Y-only output */
+    {
+        int Y[H][W];
+        memset(Y, 0, sizeof(Y));
+        for (int mb = 0; mb < mw*mh; mb++) {
+            int mx2 = mb%mw, my2 = mb/mw;
+            int out[64];
+            for (int s = 0; s < 4; s++) {
+                idct8x8(blocks[mb*6+s], out);
+                int bx=(s&1)*8, by=(s>>1)*8;
+                for (int r=0;r<8;r++) for (int c=0;c<8;c++) {
+                    int py=my2*16+by+r, px=mx2*16+bx+c;
+                    if(py<H&&px<W) Y[py][px]=clamp(out[r*8+c]+128);
+                }
+            }
+        }
+        for (int y=0;y<H;y++) for (int x=0;x<W;x++) gray[y*W+x]=Y[y][x];
+        write_ppm("/tmp/twopass_p1.ppm", gray, W, H);
+
+        double smooth = 0; int cnt = 0;
+        for (int y=0;y<H;y++) for (int x=0;x<W-1;x++) {
+            smooth += abs(Y[y][x]-Y[y][x+1]); cnt++;
+        }
+        printf("Pass 1 (level*2): smoothness=%.1f → /tmp/twopass_p1.ppm\n", smooth/cnt);
+    }
+
+    free(gray); free(disc); zip_close(z);
+    return 0;
+}
