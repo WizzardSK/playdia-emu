@@ -71,6 +71,16 @@ is not definitively confirmed — the MPEG-1 VLC match may be coincidental.
 
 ## AC Coefficient Coding: UNSOLVED
 
+### Bitstream structure (CONFIRMED)
+- **Bit-packed VLC bitstream** — confirmed by 0xFF padding at end of some frames
+- **Run-length coding of zero AC coefficients** — proven by zero-run excess (7× at 8-bit runs vs iid model)
+- **All I-frames are independent** — 99%+ byte difference between sequential frames (no inter-prediction even between consecutive I-frames)
+- **No fixed-size macroblock allocation** — variable-length coded throughout
+- **No periodic structure at any stride** — byte-level and bit-level autocorrelation flat at all lags
+- **Uniform entropy** — ~3.88 bits per 16-byte sliding window, no low-entropy regions anywhere
+- **Zero bytes inversely correlate with QS** — QS=13: 2.72% zeros, QS=7: 0.44% (higher quantization → more zeros → more RLC)
+- **First 237 payload bytes contain NO zero bytes** — suggests first ~16 MBs have dense non-zero coefficients
+
 ### What is known about the AC bitstream
 After DC decode (4100 bits), ~93800 bits remain for AC data:
 - **864 blocks × 63 AC positions = 54432 values** to code
@@ -104,6 +114,19 @@ the same decoder. If they are similar → the scheme is self-calibrating (wrong)
 - Most frames have no or minimal padding
 - **QS distribution** (32 frames): I-frames=28, P-frames=3; QS 7–40 observed
 - Higher QS (more quantization) → fewer AC bits needed → more padding
+
+### MPEG-1 AC VLC with multiple block organizations: RULED OUT
+Tested MPEG-1 Table B.14 AC VLC with 5 different block/macroblock configurations:
+| Hypothesis | Block size | MB size | Blocks | Bits consumed | Result |
+|------------|-----------|---------|--------|--------------|--------|
+| A: Standard 8×8, 16×16 MB | 8×8 | 16×16 | 864 | 2.5% (90 blocks) | VLC error after 15 MBs |
+| B: 4×4 DCT, 8×8 MB | 4×4 | 8×8 | 3456 | 12.2% (567 blocks) | Best but still fails early |
+| C: 4×4 DCT, 16×16 MB (24 blk/MB) | 4×4 | 16×16 | 3456 | 10.1% (463 blocks) | VLC error |
+| D: 4×4 DCT, flat raster | 4×4 | — | 3456 | 10.1% (475 blocks) | VLC error |
+| E: 4×4 DCT, luma DC for all | 4×4 | 8×8 | 3456 | 10.1% (475 blocks) | VLC error |
+
+All hypotheses hit VLC decode errors well before consuming the full bitstream.
+**The codec does NOT use MPEG-1 AC VLC tables in any block organization.**
 
 ### Models tested and RULED OUT
 
@@ -251,10 +274,14 @@ Tested DC (7-9 bits) + 16 AC (5-8 bits) fixed-width signed coefficients with IDC
 | `Mari-nee no Heya (Japan).zip` | 277, 502, 757, 1112, 1872, 3072, 5232 | Primary test game |
 | `Yumi to Tokoton Playdia (Japan).zip` | 502+ | Second game, same codec |
 | `Bandai Item Collection 70' (Japan).zip` | 150, 205, 235+ | Third game, confirmed same codec |
-| `Dragon Ball Z - Shin Saiyajin Zetsumetsu Keikaku (Japan).zip` | — | Fourth game, same qtable |
+| `Dragon Ball Z - Shin Saiyajin Zetsumetsu Keikaku (Japan).zip` | — | Bandai intro identical to 3 others |
+| `Ultraman - Hikari no Kyojin (Japan).zip` | — | Shares first 10 frames with DBZ |
+| `Aqua Adventure (Japan).zip` | — | Different intro, same QS=13 first frame |
+| `Sailor Moon (Japan).zip` | — | Bandai intro identical to DBZ |
 | `Ie Naki Ko (Japan).zip` | — | Ultra-sparse padded frames found |
 
 All games share identical qtable values and frame header format — qtable is likely hardcoded in the AK8000 chip.
+4 out of 5 tested games share identical first frame (Bandai logo). DBZ and Ultraman share identical first 10 frames (full Bandai intro animation).
 
 ## Tools Created
 | File | Purpose | Key Finding |
@@ -312,7 +339,7 @@ The emulator (`playdia`) builds and runs with:
 3. **Both qtable copies in header are always identical** — purpose of duplication unknown
 4. **Frame types**: 0=I-frame, 1=P-frame, plus types 2, 3, 5, 6, 31, 237 found across games
 5. **Qtable is constant across ALL games tested** (Mari-nee, DBZ, Ie Naki Ko) — likely hardcoded in AK8000
-6. **AC coding is NOT any standard VLC** — JPEG, MPEG-1, exp-Golomb all ruled out
+6. **AC coding is NOT any standard VLC** — JPEG, MPEG-1, MPEG-2, H.263, exp-Golomb, Golomb-Rice all ruled out
 7. **Self-calibration trap**: ANY variable-length code applied to random data produces
    plausible-looking statistics. Always compare real vs random data before concluding.
 8. **The AC bitstream is high-entropy** — consistent with arithmetic coding or unknown VLC
@@ -324,6 +351,13 @@ The emulator (`playdia`) builds and runs with:
 13. **MSB-first bit reading confirmed** — LSB-first tested and ruled out
 14. **DC-only video decoder implemented** in `ak8000.c` with MPEG-1 luminance DC VLC, DPCM, 4:2:0 YCbCr→RGB, 256x144
 15. **No fixed block budget** — AC bits mod 96 varies wildly across frames
+16. **Bitstream is VLC bit-packed** — confirmed by 0xFF padding, byte-aligned flush before padding
+17. **Run-length coding of zeros confirmed** — zero-run excess 7× above iid model at 8-bit runs
+18. **All I-frames are fully independent** — 99%+ byte difference between consecutive I-frames
+19. **Cross-game frame identity**: 4/5 games share identical Bandai logo intro; DBZ+Ultraman share first 10 frames
+20. **QS decreases over intro animation**: 13→13→13→13→11→10→10→8→8→7 (frames 0-9, quality ramp-up)
+21. **Frame 9 is first P-frame** (TYPE=0x01) in the Bandai intro sequence
+22. **MPEG-1 AC VLC fails in ALL block organizations** — 8×8, 4×4, 16×16 MB, 8×8 MB, flat raster all error out early
 
 ## Open Questions
 1. **What is the AC coding model?** The bitstream after DC is high-entropy with a distinctive

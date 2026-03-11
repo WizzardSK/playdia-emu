@@ -24,6 +24,16 @@ vlc_random
 *.pgm
 *.png
 frame*.bin
+*.bin
+
+# Diagnostic/test binaries
+bit_analysis
+block_vis
+compare_frames
+density_map
+multi_frame
+multi_frame2
+raw_vis
 
 # Tool binaries (source in tools/*.c is tracked)
 tools/vcodec_*
