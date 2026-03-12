@@ -346,6 +346,22 @@ static int pd_read_vlc(pd_bitstream *bs) {
 
 static int pd_clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
+// AC dequantization — clamp outlier coefficients to reduce block artifacts
+// The VLC-decoded values are the DCT coefficients; large outliers cause
+// visible color spots. Clamping to a reasonable range smooths these out.
+static void pd_dequant_ac(int coeff[64], int qscale, const uint8_t qtable[16]) {
+    (void)qtable;
+    // Clamp AC coefficients: scale inversely with QS
+    // Higher QS = more quantized = coefficients should be smaller
+    int limit = 255;
+    if (qscale > 0) limit = 2048 / qscale;
+    if (limit < 32) limit = 32;
+    for (int i = 1; i < 64; i++) {
+        if (coeff[i] > limit) coeff[i] = limit;
+        else if (coeff[i] < -limit) coeff[i] = -limit;
+    }
+}
+
 // Reference 8×8 IDCT (orthonormal, separable)
 static void pd_idct_block(const int coeff[64], uint8_t out[8][8]) {
     double temp[8][8];
@@ -469,7 +485,7 @@ static void playdia_decode_video_frame(AK8000 *v) {
         int dc_count = pd_decode_one_frame(&bs, frame_coeff);
         if (dc_count < 6) break;
 
-        // IDCT and render this frame to YCbCr planes
+        // Dequantize AC coefficients, then IDCT
         memset(Y, 128, sizeof(Y));
         memset(Cb, 128, sizeof(Cb));
         memset(Cr, 128, sizeof(Cr));
@@ -477,6 +493,8 @@ static void playdia_decode_video_frame(AK8000 *v) {
         for (int i = 0; i < dc_count; i++) {
             int mb = i / 6, bl = i % 6;
             int mx = mb % PD_MW, my = mb / PD_MW;
+
+            pd_dequant_ac(frame_coeff[i], qscale, v->qtable);
 
             uint8_t block[8][8];
             pd_idct_block(frame_coeff[i], block);
@@ -679,6 +697,137 @@ static void xa_decode_sector(AK8000 *v, const uint8_t *sector_data,
 }
 
 // ─────────────────────────────────────────────────────────────
+//  F2 Interactive Command Parser
+//
+//  F2 commands with submode=0x09 control interactive gameplay.
+//  MSF destinations use binary encoding (NOT BCD):
+//    abs_frame = M*4500 + S*75 + F
+//    target_lba = abs_frame - 150  (LBA 0 = frame 150)
+// ─────────────────────────────────────────────────────────────
+static uint32_t f2_msf_to_lba(uint8_t m, uint8_t s, uint8_t f) {
+    uint32_t abs_frame = (uint32_t)m * 4500 + (uint32_t)s * 75 + (uint32_t)f;
+    if (abs_frame < 150) return 0;
+    return abs_frame - 150;
+}
+
+static void ak8000_parse_f2_command(AK8000 *v, const uint8_t *payload,
+                                     uint32_t current_lba) {
+    uint8_t cmd_type = payload[1];
+    v->interactive_cmd = cmd_type;
+    v->cmd_lba = current_lba;
+
+    // Parse 7 button destinations: payload[3..30] = 7 × (M S F extra)
+    for (int i = 0; i < 7; i++) {
+        int off = 3 + i * 4;
+        uint8_t m = payload[off + 0];
+        uint8_t s = payload[off + 1];
+        uint8_t f = payload[off + 2];
+        v->button_dest[i]  = f2_msf_to_lba(m, s, f);
+        v->button_extra[i] = payload[off + 3];
+    }
+
+    switch (cmd_type) {
+    case 0x40:
+        // Unconditional jump — all 7 slots have same destination
+        // Detect backward jumps (loops): dest <= current position
+        v->is_loop = (v->button_dest[0] <= current_lba);
+        v->seek_target = v->button_dest[0];
+        v->interactive_pending = true;
+        v->waiting_for_input = false; // loops and forward jumps both auto-seek
+        if (v->is_loop) {
+            printf("[AK8000] F2 40 LOOP @ LBA %u (dest=%u)\n",
+                   current_lba, v->button_dest[0]);
+        } else {
+            printf("[AK8000] F2 40 JUMP @ LBA %u → LBA %u\n",
+                   current_lba, v->seek_target);
+        }
+        break;
+
+    case 0x44:
+        // Player choice — 7 different destinations per button
+        v->interactive_pending = true;
+        v->waiting_for_input = true;
+        v->input_timer = 300;  // ~10 seconds at 30fps default timeout
+        printf("[AK8000] F2 44 CHOICE: ");
+        for (int i = 0; i < 7; i++)
+            printf("B%d=%u ", i + 1, v->button_dest[i]);
+        printf("\n");
+        break;
+
+    case 0x50:
+        // Quiz answer verification — all destinations same, extra byte = correct flag
+        v->interactive_pending = true;
+        v->waiting_for_input = true;
+        v->input_timer = 300;
+        printf("[AK8000] F2 50 QUIZ → LBA %u (", v->button_dest[0]);
+        for (int i = 0; i < 6; i++)
+            printf("%s%s", v->button_extra[i] ? "correct" : "wrong",
+                   i < 5 ? "," : "");
+        printf(")\n");
+        break;
+
+    case 0x60:
+        // Timed jump / animation control
+        v->seek_target = v->button_dest[0];
+        v->interactive_pending = true;
+        v->waiting_for_input = false;
+        printf("[AK8000] F2 60 TIMED → LBA %u (flags=%02X)\n",
+               v->seek_target, payload[2]);
+        break;
+
+    case 0x80:
+        // Timeout handler — sets timeout destination for preceding F2 44
+        v->timeout_sub = payload[2];
+        if (payload[3] != 0 || payload[4] != 0 || payload[5] != 0) {
+            v->timeout_dest = f2_msf_to_lba(payload[3], payload[4], payload[5]);
+        } else {
+            v->timeout_dest = 0; // no timeout
+        }
+        // F2 80 is a modifier, not a navigation command — don't set pending
+        printf("[AK8000] F2 80 TIMEOUT: dest=%u sub=%02X\n",
+               v->timeout_dest, v->timeout_sub);
+        break;
+
+    case 0x90:
+        // Score/result display — auto-advance
+        v->seek_target = v->button_dest[0];
+        v->interactive_pending = true;
+        v->waiting_for_input = false;
+        printf("[AK8000] F2 90 RESULT → LBA %u\n", v->seek_target);
+        break;
+
+    case 0xA0:
+        // Loop/animation control
+        // Flag F0 = boot/reset marker — ignore (part of intro boot sequence)
+        if (payload[2] == 0xF0) {
+            printf("[AK8000] F2 A0 BOOT (F0) — skipping\n");
+            break;
+        }
+        // Other flags: treat as auto-advance
+        v->is_loop = (v->button_dest[0] <= current_lba);
+        if (v->is_loop) {
+            // Backward A0 is a scene loop — same as F2 40 loop
+            v->seek_target = v->button_dest[0];
+            v->interactive_pending = true;
+            v->waiting_for_input = false;
+            printf("[AK8000] F2 A0 LOOP @ LBA %u (dest=%u, flags=%02X)\n",
+                   current_lba, v->button_dest[0], payload[2]);
+        } else {
+            v->seek_target = v->button_dest[0];
+            v->interactive_pending = true;
+            v->waiting_for_input = false;
+            printf("[AK8000] F2 A0 JUMP → LBA %u (flags=%02X)\n",
+                   v->seek_target, payload[2]);
+        }
+        break;
+
+    default:
+        printf("[AK8000] F2 %02X UNKNOWN\n", cmd_type);
+        break;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Feed CD-XA sector with channel-based demuxing
 //  Reads subheader at offset 16 to route audio vs video
 // ─────────────────────────────────────────────────────────────
@@ -697,7 +846,7 @@ void ak8000_feed_xa_sector(AK8000 *v, const uint8_t *raw_sector) {
         return;
     }
 
-    // Video/data sector: channel 0, submode 0x08
+    // Video/data sector: channel 0, submode has Data bit (0x08) set
     if (channel == 0 && (submode & 0x08)) {
         // Mode 2 Form 1 data at offset 24, 2048 bytes
         const uint8_t *payload = raw_sector + 24;
@@ -711,15 +860,28 @@ void ak8000_feed_xa_sector(AK8000 *v, const uint8_t *raw_sector) {
                 v->vid_frame_pos += copy;
             }
         } else if (marker == 0xF2) {
-            // Frame end marker — decode the assembled video frame
-            if (v->vid_frame_pos >= 6 * 2047 &&
-                v->vid_frame_buf[0] == 0x00 &&
-                v->vid_frame_buf[1] == 0x80 &&
-                v->vid_frame_buf[2] == 0x04) {
-                v->vid_frame_pos = 6 * 2047;
-                playdia_decode_video_frame(v);
+            // Check submode for interactive command (0x09 = Data+EOR)
+            // vs regular frame-end marker (0x08 = Data only)
+            if ((submode & 0x01) && payload[1] != 0x00) {
+                // ── Interactive F2 command (submode 0x09) ─────────
+                // Extract current LBA from sector MSF header (BCD at bytes 12-14)
+                uint8_t mm = raw_sector[12], ss = raw_sector[13], ff = raw_sector[14];
+                uint32_t cur_lba = ((mm/16)*10 + (mm%16)) * 4500 +
+                                   ((ss/16)*10 + (ss%16)) * 75 +
+                                   ((ff/16)*10 + (ff%16));
+                if (cur_lba >= 150) cur_lba -= 150;
+                ak8000_parse_f2_command(v, payload, cur_lba);
+            } else {
+                // ── Regular frame-end marker (submode 0x08) ──────
+                if (v->vid_frame_pos >= 6 * 2047 &&
+                    v->vid_frame_buf[0] == 0x00 &&
+                    v->vid_frame_buf[1] == 0x80 &&
+                    v->vid_frame_buf[2] == 0x04) {
+                    // Use all accumulated F1 data (6-13 sectors typical)
+                    playdia_decode_video_frame(v);
+                }
+                v->vid_frame_pos = 0;
             }
-            v->vid_frame_pos = 0;
         } else if (marker == 0xF3) {
             // Scene marker — reset frame accumulator
             v->vid_frame_pos = 0;

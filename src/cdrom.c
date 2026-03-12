@@ -396,14 +396,15 @@ int cdrom_load_cue(CDROM *cd, const char *cue_path) {
         return -1;
     }
 
-    CueSheet sheet; memset(&sheet, 0, sizeof sheet);
-    sheet.data_track = -1;
+    // Parse CUE: collect all FILE entries with their associated track modes
+    #define MAX_CUE_BIN_FILES 8
+    char  bin_paths[MAX_CUE_BIN_FILES][1024];
+    bool  bin_raw[MAX_CUE_BIN_FILES];
+    int   n_bin_files = 0;
 
-    char bin_path[1024] = {0};
-    char bin_name[512]  = {0};
-    int  cur_track      = -1;
-    TrackType cur_type  = TRACK_AUDIO;
-    uint32_t  index01_lba = 0;
+    int  cur_file_idx = -1;  // index into bin_paths for current FILE
+    int  n_tracks  = 0;
+    int  data_track = -1;
 
     char line[512];
     while (fgets(line, sizeof line, cue)) {
@@ -414,113 +415,126 @@ int cdrom_load_cue(CDROM *cd, const char *cue_path) {
         if (strncasecmp(line, "FILE", 4) == 0) {
             char *q1 = strchr(line, '"');
             char *q2 = q1 ? strchr(q1+1, '"') : NULL;
-            if (q1 && q2) {
+            if (q1 && q2 && n_bin_files < MAX_CUE_BIN_FILES) {
+                char bin_name[512] = {0};
                 int n = (int)(q2-q1-1);
                 if (n >= (int)sizeof bin_name) n = (int)sizeof bin_name - 1;
                 memcpy(bin_name, q1+1, n); bin_name[n] = '\0';
-                resolve_path(cue_path, bin_name, bin_path, sizeof bin_path);
+                cur_file_idx = n_bin_files;
+                resolve_path(cue_path, bin_name,
+                             bin_paths[cur_file_idx],
+                             sizeof(bin_paths[0]));
+                bin_raw[cur_file_idx] = true;
+                n_bin_files++;
             }
             continue;
         }
 
         // TRACK nn MODE1/2352 | MODE2/2352 | AUDIO
         if (strncasecmp(line, "TRACK", 5) == 0) {
-            // Save previous track
-            if (cur_track >= 0 && cur_track < CUE_MAX_TRACKS) {
-                sheet.tracks[cur_track].lba_start = index01_lba;
-                sheet.tracks[cur_track].type      = cur_type;
-                if (cur_track > 0) {
-                    sheet.tracks[cur_track-1].n_sectors =
-                        index01_lba - sheet.tracks[cur_track-1].lba_start;
-                }
-            }
-
-            int tnum = 0;
             char tmode[32] = {0};
+            int tnum = 0;
             sscanf(line+5, " %d %31s", &tnum, tmode);
-            cur_track = tnum - 1; // 0-based
+            int cur_track = tnum - 1;
+            if (cur_track >= 0 && cur_track + 1 > n_tracks)
+                n_tracks = cur_track + 1;
 
-            if (strncasecmp(tmode,"MODE1",5)==0)     cur_type = TRACK_MODE1_2352;
-            else if (strncasecmp(tmode,"MODE2",5)==0) cur_type = TRACK_MODE2_2352;
-            else                                      cur_type = TRACK_AUDIO;
-
-            if (cur_type != TRACK_AUDIO && sheet.data_track < 0)
-                sheet.data_track = cur_track;
-
-            if (cur_track < CUE_MAX_TRACKS)
-                sheet.n_tracks = (cur_track+1 > sheet.n_tracks)
-                                 ? cur_track+1 : sheet.n_tracks;
-            continue;
-        }
-
-        // INDEX 01 MM:SS:FF
-        if (strncasecmp(line, "INDEX 01", 8) == 0) {
-            index01_lba = msf_parse(line + 9);
-            if (cur_track >= 0 && cur_track < CUE_MAX_TRACKS)
-                sheet.tracks[cur_track].lba_start = index01_lba;
+            if (strncasecmp(tmode,"MODE1",5)==0 ||
+                strncasecmp(tmode,"MODE2",5)==0) {
+                if (data_track < 0) data_track = cur_track;
+            }
             continue;
         }
     }
     fclose(cue);
 
-    // Finalize last track
-    if (cur_track >= 0 && cur_track < CUE_MAX_TRACKS)
-        sheet.tracks[cur_track].lba_start = index01_lba;
-
-    if (sheet.data_track < 0) {
-        fprintf(stderr, "[CDROM] No data track found in CUE\n");
+    if (n_bin_files == 0) {
+        fprintf(stderr, "[CDROM] No FILE entries in CUE\n");
         return -1;
     }
 
-    printf("[CDROM] CUE parsed: %d tracks, data track=%d (%s)\n",
-           sheet.n_tracks, sheet.data_track+1,
-           sheet.tracks[sheet.data_track].type==TRACK_MODE2_2352
-           ? "MODE2/2352" : "MODE1/2352");
+    printf("[CDROM] CUE parsed: %d tracks, %d BIN files\n",
+           n_tracks, n_bin_files);
 
-    // Open BIN file
-    if (!bin_path[0]) {
-        fprintf(stderr, "[CDROM] No FILE entry in CUE\n");
+    // If only one BIN file, use legacy single-source mode
+    if (n_bin_files == 1) {
+        cds_close(&cd->src);
+        cd->src.fp = fopen(bin_paths[0], "rb");
+        if (!cd->src.fp) {
+            fprintf(stderr, "[CDROM] Cannot open BIN: %s\n", bin_paths[0]);
+            return -1;
+        }
+
+        fseek(cd->src.fp, 0, SEEK_END);
+        long bin_size = ftell(cd->src.fp);
+        fseek(cd->src.fp, 0, SEEK_SET);
+
+        cd->raw_mode        = true;
+        cd->total_sectors   = (uint32_t)(bin_size / SECTOR_SIZE);
+        cd->cue_data_offset = 0;
+        cd->lba             = 0;
+        cd->disc_present    = true;
+        cd->motor_on        = true;
+        cd->status          = CDROM_STAT_READY;
+        cd->n_track_srcs    = 0; // use legacy single src
+
+        printf("[CDROM] BIN: %s  (%u sectors, %ld MB)\n",
+               bin_paths[0], cd->total_sectors, bin_size / 1048576);
+
+        cdrom_parse_iso(cd);
+        return 0;
+    }
+
+    // Multiple BIN files → use multi-track TrackSource array
+    cd->n_track_srcs = 0;
+    uint32_t lba_cursor = 0;
+
+    for (int i = 0; i < n_bin_files && cd->n_track_srcs < MAX_TRACK_SRCS; i++) {
+        FILE *fp = fopen(bin_paths[i], "rb");
+        if (!fp) {
+            fprintf(stderr, "[CDROM] Cannot open BIN: %s\n", bin_paths[i]);
+            continue;
+        }
+
+        fseek(fp, 0, SEEK_END);
+        long bin_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        TrackSource *ts = &cd->tracks[cd->n_track_srcs];
+        memset(ts, 0, sizeof(*ts));
+        ts->src.fp    = fp;
+        ts->raw_mode  = bin_raw[i];
+        ts->lba_start = lba_cursor;
+
+        int bps = ts->raw_mode ? SECTOR_SIZE : SECTOR_DATA;
+        ts->n_sectors = (uint32_t)(bin_size / bps);
+        lba_cursor += ts->n_sectors;
+
+        printf("[CDROM] Track %d: \"%s\"  LBA %u–%u (%u sectors, %ld MB)\n",
+               cd->n_track_srcs + 1, bin_paths[i],
+               ts->lba_start, ts->lba_start + ts->n_sectors - 1,
+               ts->n_sectors, bin_size / 1048576);
+
+        cd->n_track_srcs++;
+    }
+
+    if (cd->n_track_srcs == 0) {
+        fprintf(stderr, "[CDROM] No BIN files could be opened\n");
         return -1;
     }
 
-    cds_close(&cd->src);
-    cd->src.fp = fopen(bin_path, "rb");
-    if (!cd->src.fp) {
-        // Try same directory as CUE
-        fprintf(stderr, "[CDROM] Cannot open BIN: %s\n", bin_path);
-        return -1;
-    }
+    cd->raw_mode        = true;
+    cd->cue_data_offset = 0;
+    cd->total_sectors   = lba_cursor;
+    cd->disc_present    = true;
+    cd->motor_on        = true;
+    cd->status          = CDROM_STAT_READY;
+    cd->lba             = 0;
 
-    fseek(cd->src.fp, 0, SEEK_END);
-    long bin_size = ftell(cd->src.fp);
-    fseek(cd->src.fp, 0, SEEK_SET);
+    printf("[CDROM] Total: %u sectors across %d tracks\n",
+           cd->total_sectors, cd->n_track_srcs);
 
-    // BIN is always raw 2352 bytes/sector
-    cd->raw_mode      = true;
-    cd->total_sectors = (uint32_t)(bin_size / SECTOR_SIZE);
-
-    // Compute file byte offset for data track
-    CueTrack *dt = &sheet.tracks[sheet.data_track];
-    dt->file_offset = dt->lba_start * SECTOR_SIZE;
-
-    // Seek to start of data track for LBA 0
-    cd->lba          = 0;
-    cd->disc_present = true;
-    cd->motor_on     = true;
-    cd->status       = CDROM_STAT_READY;
-
-    printf("[CDROM] BIN: %s  (%u sectors, %ld MB)\n",
-           bin_path, cd->total_sectors, bin_size/1048576);
-    printf("[CDROM] Data track starts at LBA %u (file offset %u)\n",
-           dt->lba_start, dt->file_offset);
-
-    // Store byte offset so cdrom_read_sector adds it automatically
-    cd->cue_data_offset = dt->file_offset;
-    cd->lba = 0;
-
-    // Parse ISO 9660 (sector 16 = PVD, relative to data track start)
     cdrom_parse_iso(cd);
-
     return 0;
 }
 

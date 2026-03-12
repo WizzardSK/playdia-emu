@@ -8,8 +8,9 @@
 //  Asahi Kasei AK8000  —  Audio/Video Processor
 //
 //  The AK8000 uses a proprietary video codec (NOT standard MPEG-1).
-//  Video frames are assembled from 6 × F1 sectors (12282 bytes)
+//  Video frames are assembled from 6-13 F1 sectors (12282-26611 bytes)
 //  with a 40-byte header and DCT-based compression.
+//  Most packets use 8 F1 sectors (16376 bytes) containing 3 frames.
 //
 //  Video: 256×144, 4:2:0, ~15fps, MPEG-1 DC VLC with DPCM
 //         (AC coefficient coding not yet reverse-engineered)
@@ -92,6 +93,19 @@ typedef struct AK8000 {
     uint8_t  qtable[16];             // 4×4 quantization table
     uint8_t  qscale;                 // quantization scale factor
     int      dc_pred[3];             // DC DPCM predictors (Y, Cb, Cr)
+
+    // ── Interactive FMV state ────────────────────────────────
+    bool     interactive_pending;    // F2 command ready for processing
+    bool     waiting_for_input;     // paused waiting for player button
+    uint8_t  interactive_cmd;       // F2 command type (0x40, 0x44, etc.)
+    uint32_t button_dest[7];        // 7 button destination LBAs
+    uint8_t  button_extra[7];       // extra byte per button slot
+    uint32_t timeout_dest;          // F2 80 timeout destination LBA
+    uint8_t  timeout_sub;           // F2 80 subcommand byte
+    int      input_timer;           // frames remaining before timeout
+    uint32_t seek_target;           // LBA to seek to (0 = none pending)
+    uint32_t cmd_lba;               // LBA where last F2 command was found
+    bool     is_loop;               // true if F2 40 is a backward jump (loop)
 } AK8000;
 
 // ── API ───────────────────────────────────────────────────────

@@ -106,8 +106,27 @@ static int route_sector(Pipeline *pl, CDROM *cd, AK8000 *av,
 int pipeline_run_frame(Pipeline *pl, CDROM *cd, AK8000 *av) {
     if (!cd->disc_present || !cd->streaming) return 0;
 
+    // If waiting for player input (F2 44/50), pause streaming
+    if (av->waiting_for_input) return 0;
+
+    // Handle pending seek (from F2 command resolution)
+    if (av->seek_target > 0) {
+        uint32_t target = av->seek_target;
+        av->seek_target = 0;
+        av->interactive_pending = false;
+
+        // Reset video frame accumulator for clean scene start
+        av->vid_frame_pos = 0;
+
+        printf("[Pipeline] SEEK → LBA %u\n", target);
+        cdrom_seek(cd, target);
+    }
+
     int fed = 0;
     for (int i = 0; i < PIPE_SECTORS_PER_FRAME; i++) {
+        // Stop feeding if an interactive command was just parsed
+        if (av->interactive_pending) break;
+
         if (cdrom_stream_tick(cd) && cd->sector_ready)
             fed += route_sector(pl, cd, av, NULL, 0);
     }

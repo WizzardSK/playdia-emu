@@ -61,6 +61,14 @@ static void run_cpu_test(void) {
 static void run_headless(Playdia *p, uint32_t max_frames) {
     printf("[Headless] Running %u frames...\n", max_frames);
     for (uint32_t f = 0; f < max_frames && p->running; f++) {
+        // Auto-advance in headless: break loops and auto-choose
+        if (p->video.is_loop && p->video.interactive_cmd == 0x40)
+            p->controller = BTN_START;
+        else if (p->video.waiting_for_input)
+            p->controller = BTN_A;
+        else
+            p->controller = 0;
+
         playdia_run_frame(p);
         // Drain audio even in headless (for stats + to prevent ring overflow)
         pipeline_drain_audio(&p->pipe, &p->video);

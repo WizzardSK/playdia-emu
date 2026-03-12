@@ -128,6 +128,74 @@ void playdia_mem_write(Playdia *p, uint16_t addr, uint8_t val) {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Interactive FMV handler
+//
+//  Called each frame to process F2 commands from the AK8000.
+//  Maps controller buttons to Playdia's 7 button slots:
+//    B1 = default/timeout (no press or Start)
+//    B2 = Up        B3 = Down
+//    B4 = Left      B5 = Right
+//    B6 = A         B7 = B
+// ─────────────────────────────────────────────────────────────
+static void playdia_handle_interactive(Playdia *p) {
+    AK8000 *v = &p->video;
+
+    if (!v->interactive_pending) return;
+
+    uint8_t btn = p->controller;
+
+    // ── F2 40 loop: button press breaks out ──────────────────
+    if (v->is_loop && v->interactive_cmd == 0x40) {
+        if (btn) {
+            // Any button breaks the loop — continue streaming past the F2 40
+            v->seek_target = 0;
+            v->interactive_pending = false;
+            v->is_loop = false;
+            printf("[Interactive] BREAK LOOP @ LBA %u\n", v->cmd_lba);
+        }
+        // No button → seek_target already set, pipeline will loop
+        return;
+    }
+
+    // ── Forward F2 40/60/90/A0: auto-seek, no input needed ──
+    if (!v->waiting_for_input) return;
+
+    // ── Waiting for player input (F2 44, F2 50) ─────────────
+    int choice = -1;
+    if (btn & BTN_UP)        choice = 1;  // B2
+    else if (btn & BTN_DOWN) choice = 2;  // B3
+    else if (btn & BTN_LEFT) choice = 3;  // B4
+    else if (btn & BTN_RIGHT)choice = 4;  // B5
+    else if (btn & BTN_A)    choice = 5;  // B6
+    else if (btn & BTN_B)    choice = 6;  // B7
+    else if (btn & BTN_START)choice = 0;  // B1 (default)
+
+    if (choice >= 0) {
+        v->seek_target = v->button_dest[choice];
+        v->waiting_for_input = false;
+        v->interactive_pending = false;
+        printf("[Interactive] Button %d → LBA %u\n", choice + 1, v->seek_target);
+        return;
+    }
+
+    // Countdown timeout
+    if (v->input_timer > 0) {
+        v->input_timer--;
+        if (v->input_timer == 0) {
+            if (v->timeout_dest > 0) {
+                v->seek_target = v->timeout_dest;
+                printf("[Interactive] TIMEOUT → LBA %u (F2 80 dest)\n", v->seek_target);
+            } else {
+                v->seek_target = v->button_dest[0];
+                printf("[Interactive] TIMEOUT → LBA %u (B1 default)\n", v->seek_target);
+            }
+            v->waiting_for_input = false;
+            v->interactive_pending = false;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Run one frame  (1/30 second)
 // ─────────────────────────────────────────────────────────────
 void playdia_run_frame(Playdia *p) {
@@ -158,6 +226,9 @@ void playdia_run_frame(Playdia *p) {
                 cpu_nec78k_step(&p->io_cpu);
         }
     }
+
+    // ── Handle interactive FMV commands ─────────────────────
+    playdia_handle_interactive(p);
 
     // End-of-frame: feed CD sectors → AK8000 via pipeline
     pipeline_run_frame(&p->pipe, &p->cdrom, &p->video);

@@ -35,12 +35,31 @@ Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Ful
 |-----------|--------|
 | TLCS-870 CPU | Basic instruction set |
 | NEC 78K/0 CPU | Basic instruction set |
-| CD-ROM | CUE/BIN loading, raw Mode 2/2352, ZIP support |
-| BIOS HLE | Auto-scan for video, FMV playback loop |
-| Video decode | **Full DC+AC+IDCT** (proprietary AK8000 codec) |
+| CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
+| BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
+| Video decode | **Full DC+AC+IDCT+dequant** (proprietary AK8000 codec) |
 | Audio decode | **XA ADPCM** with resampling to 44100 Hz |
+| Interactive | **F2 commands** — jumps, choices (F2 44), loops, quiz, timeout |
 | Display | SDL2, 320×240, 256×144 video centered |
 | Pipeline | 10 sectors/frame @ 30fps (~4× CD speed) |
+
+### Interactive FMV Commands
+
+The Playdia uses F2 sectors with submode `0x09` for interactive control:
+
+| Command | Function | Implementation |
+|---------|----------|---------------|
+| F2 40 | Unconditional jump / scene loop | Forward=auto-seek, backward=loop until button |
+| F2 44 | Player choice (7 button destinations) | Wait for input, seek to chosen destination |
+| F2 50 | Quiz answer verification | Wait for input, extra byte = correct/wrong flag |
+| F2 60 | Timed jump / animation | Auto-seek with duration parameter |
+| F2 80 | Timeout handler | Sets fallback destination for preceding F2 44 |
+| F2 90 | Score/result display | Auto-seek, sequential counter per button |
+| F2 A0 | Loop/animation control | Flag F0 = boot marker (skipped) |
+
+Button mapping: B1=Start/default, B2=Up, B3=Down, B4=Left, B5=Right, B6=A, B7=B
+
+MSF destination encoding: `target_LBA = M×4500 + S×75 + F − 150` (binary, not BCD)
 
 ---
 
@@ -52,7 +71,7 @@ The AK8000 uses a proprietary DCT-based video codec. No documentation exists any
 - **F1 sectors**: Video data (marker byte `0xF1`, 2047 bytes payload)
 - **F2 sectors**: End-of-frame marker (triggers decode of assembled frame)
 - **F3 sectors**: Scene marker (reset frame accumulator)
-- Each video frame: **6 × F1 sectors × 2047 bytes = 12282 bytes**
+- Each video packet: **6–13 F1 sectors** (typically 8 = 16376 bytes, containing 3 frames)
 
 ## Frame Header (40 bytes)
 ```
@@ -62,7 +81,7 @@ Offset  Content
 [4-19]  16-byte qtable    — quantization table (constant across all games tested)
 [20-35] 16-byte qtable    — identical copy
 [36-38] 00 80 24          — second marker
-[39]    TYPE              — frame type (0=I, 1=P, plus 2,3,5,6,31,237)
+[39]    TYPE              — purpose unknown (common values: 0x00, 0x06, 0x07)
 ```
 
 The qtable is always `0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14` — likely hardcoded in the AK8000 chip.
@@ -103,13 +122,14 @@ Magnitude bits use sign-magnitude: if value < 2^(size-1), subtract 2^size - 1.
 
 ## Multi-Frame Packing
 
-Each 12282-byte packet contains **2–4 independent frames** in the bitstream:
+Each packet contains **2–4 independent frames** in a continuous bitstream:
 
-| QS | Frames per packet | Notes |
-|----|-------------------|-------|
-| 13 | 3 | ~33% bits each |
-| 11 | 3 | ~33% bits each |
-| 8  | 4 | ~25% bits each |
+| F1 sectors | Packet size | Typical frames | Frequency |
+|------------|-------------|----------------|-----------|
+| 8 | 16376 bytes | 3 | 90.8% |
+| 7 | 14329 bytes | 2–3 | 6.0% |
+| 13 | 26611 bytes | 4+ | 2.5% |
+| 6 | 12282 bytes | 2 | 0.6% |
 
 The "100" = EOB discovery was key: it produces **even frame distribution** (confirmed by bit consumption analysis). Without it, 76% of bits go to the first frame.
 
@@ -159,11 +179,13 @@ for each block (0..863):
         k++
 ```
 
-## Dequantization (PARTIALLY SOLVED)
+## Dequantization
 
 - **DC**: Scale ×1 gives correct pixel values (IDCT's 1/8 normalization handles it)
-- **AC**: Raw coefficients produce visible block artifacts. Dividing by 8, QS, or qtable all reduce artifacts. The exact formula involving the 16-entry qtable and QS is still unknown.
-- AC coefficient range: avg |AC| ≈ 10–15, outliers up to ±2033
+- **AC**: VLC-decoded values are the raw DCT coefficients (no multiply-based dequant needed). Outlier values (up to ±2033) cause localized color spike artifacts. Clamping AC to ±2048/QS removes these while preserving detail.
+- AC coefficient range: avg |AC| ≈ 10–15, rare outliers up to ±2033
+- Tested: MPEG-1 style multiply (AC×QS×qt/N) produces garbled output; clamping produces clean frames
+- Remaining block boundaries are inherent to the codec's bitrate (~4KB per 256×144 frame)
 
 ## XA ADPCM Audio
 
@@ -215,7 +237,7 @@ Any variable-length code applied to random data will consume a predictable perce
 See git history for the full set of ~80 test tools in `tools/`.
 
 ## Open Questions
-1. **AC dequantization formula**: The 16-entry qtable and QS byte control AC scaling, but the exact formula is unknown.
-2. **Frame types beyond I/P**: Types 2, 3, 5, 6, 31, 237 have unknown semantics.
-3. **P-frame coding**: Only I-frames are currently decoded. P-frames likely use motion compensation.
+1. **Qtable purpose**: The 16-entry qtable is constant across all games and all QS values. It does NOT participate in AC dequantization (tested: MPEG-1 style multiply produces garbled output). May be encoder-only.
+2. **Byte [39] purpose**: Common values 0x00, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata, scene flags, or content hints.
+3. **P-frames**: All tested frames decode as independent I-frames with the same decoder. No evidence of traditional P-frame coding (delta/motion compensation) found yet. The codec may be I-frame only.
 4. **IDCT optimization**: Currently uses reference floating-point IDCT (works but slow for non-optimized builds).
