@@ -37,7 +37,7 @@ Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Ful
 | NEC 78K/0 CPU | Basic instruction set |
 | CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
 | BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
-| Video decode | **DC + AC (split Y/C clamp) + integer IDCT + deblocking** (proprietary AK8000 codec) |
+| Video decode | **DC + AC (packed run-level rl3 model) + integer IDCT + deblocking** (proprietary AK8000 codec) |
 | Audio decode | **XA ADPCM** with resampling to 44100 Hz |
 | Interactive | **F2 commands** — jumps, choices (F2 44), loops, quiz, timeout |
 | Display | SDL2, 320×240, 256×144 video centered |
@@ -122,7 +122,7 @@ Magnitude bits use sign-magnitude: if value < 2^(size-1), subtract 2^size - 1.
 
 ## Multi-Frame Packing
 
-Each packet contains **3 independent frames** in a continuous bitstream (DC+AC per frame, packed back-to-back with no byte alignment):
+Each packet contains **2–4 independent frames** in a continuous bitstream (DC+AC per frame, packed back-to-back with no byte alignment). Frame count depends on content complexity and QS:
 
 | F1 sectors | Packet size | Frames | Frequency |
 |------------|-------------|--------|-----------|
@@ -143,41 +143,59 @@ Bitstream analysis confirms: each frame's DC section (~3800 bits) + AC section (
 - Block 4: Cb predictor
 - Block 5: Cr predictor
 
-### Phase 2: AC Coefficients
-864 blocks of sequential VLC-coded AC coefficients (zigzag positions 1–63).
+### Phase 2: AC Coefficients — Packed Run-Level Coding
 
-For each block:
-1. Read VLC value for position k (starting at k=1)
-2. If value = 0 (`100` in binary, VLC size 0) → **end of block**
-3. Otherwise, store value as coefficient at zigzag position k, advance k
-4. Repeat until EOB or k reaches 64
+864 blocks of VLC-coded AC coefficients using a packed run-level scheme.
+
+Each VLC value encodes a **(run, level)** pair:
+- Value = 0 → **end of block**
+- |value| = 1..3 → run=0, level=|value| (coefficient at current zigzag position)
+- |value| > 3 → `run = (|v|-1) / 3`, `level = ((|v|-1) % 3) + 1` (skip zeros, then place coefficient)
+- Sign preserved from VLC sign
+- Position overflow (k ≥ 64) → implicit end-of-block
+
+Examples:
+| VLC value | Run | Level | Meaning |
+|-----------|-----|-------|---------|
+| ±1 | 0 | 1 | Coefficient ±1 at current position |
+| ±3 | 0 | 3 | Coefficient ±3 at current position |
+| ±4 | 1 | 1 | Skip 1 zero, then ±1 |
+| ±9 | 2 | 3 | Skip 2 zeros, then ±3 |
+| ±71 | 23 | 2 | Skip 23 zeros, then ±2 |
+
+This explains the previously mysterious "outlier" values (|v| > 3, ~33% of AC values): they encode zero-run skips, not large coefficient magnitudes. The value distribution (|1|=43.8%, |2|=16.4%, |3|=11.7%, sharp drop to |4|=2.4%) exactly matches run=0 being most common.
+
+**Chroma handling**: Cb/Cr blocks have AC data in the bitstream (must be read to maintain sync) but it is discarded — only luma (Y) AC coefficients are applied. Applying chroma AC produces rainbow noise artifacts.
 
 ### Pseudocode
 ```c
 for each block (0..863):
-    is_luma = (block_index % 6 < 4)
-    clamp_val = is_luma ? 32 : 4
-    for k = 1 to 63:
-        level = read_vlc()       // same extended VLC table as DC
-        if level == 0: break     // EOB ("100" = VLC size 0)
-        coeff[k] = clamp(level, -clamp_val, clamp_val)
+    k = 1  // starting zigzag position
+    while k < 64:
+        v = read_vlc()
+        if v == 0: break          // EOB
+        sign = (v > 0) ? +1 : -1
+        run   = (abs(v) - 1) / 3
+        level = ((abs(v) - 1) % 3) + 1
+        k += run                  // skip zeros
+        if k >= 64: break         // overflow = implicit EOB
+        if is_luma_block:
+            coeff[k] = sign * level * 32  // fixed dequant
+        k++
 ```
 
-### AC Clamping — Split Y/Cb/Cr
+### Validation
 
-The sequential VLC model correctly identifies frame boundaries and consumes the right number of bits (97935/97936 for a typical 12282-byte packet). However, ~33% of decoded AC values are outliers (|value| > 3), uniformly distributed across all zigzag positions and block types, suggesting an additional coding layer not yet understood.
-
-Raw VLC-decoded values are used directly as DCT coefficients (no QS multiplication needed). Testing confirmed that unclamped Y blocks reveal real image detail (scenery, edges), while unclamped Cb/Cr blocks create visible colored-dot artifacts. The split clamping approach:
-
-- **Y (luma) blocks**: clamp to ±32 — allows genuine AC detail through the IDCT. Values up to ±32 contribute ~5–6 pixel variation, which is visible as real texture/edges. Luma noise from outlier values manifests as subtle grain rather than colored dots.
-- **Cb/Cr (chroma) blocks**: clamp to ±4 — chroma outliers create highly visible colored dots even at small magnitudes. Tight clamping eliminates these while preserving low-frequency color detail.
-
-This approach produces consistent quality across all QS values (7–36) without needing QS in the dequantization formula.
+The packed run-level model is validated by multi-frame decoding:
+- Consumes exactly 100% of packet bits across all QS values
+- Produces balanced frame sizes (e.g., 33.5% / 34.7% / 31.7% for 3-frame packet)
+- Each decoded frame has distinct, plausible scene colors
+- Frame boundaries are self-consistent (frame 2 starts exactly where frame 1 ends)
 
 ## Dequantization
 
 - **DC**: Raw VLC-decoded DPCM values used directly as DCT coefficient[0]. The IDCT's 1/8 normalization gives correct pixel values with +128 level shift.
-- **AC**: Raw VLC values used directly with split Y/C clamping (Y: ±32, Cb/Cr: ±4). No quantization scale multiplication needed — the true role of the QS header byte remains unknown.
+- **AC**: `sign × level × 32` (fixed multiplier, Y blocks only). The dequant is QS-independent — QS controls encoder-side quantization aggressiveness (fewer non-zero coefficients at low QS) but the decoder uses a constant scaling factor.
 
 ## XA ADPCM Audio
 
@@ -204,16 +222,18 @@ All games share identical qtable values and frame header format.
 
 ## Reverse Engineering Methodology
 
-### Key Discovery: Sequential VLC for AC
-The breakthrough came from bitstream analysis showing that each packet contains exactly 3 frames, each consuming ~33% of the data:
-- **DC section**: ~3800 bits (864 DPCM VLC-coded coefficients)
-- **AC section**: ~29000 bits (864 blocks of sequential VLC values, VLC=0 as EOB)
-- Three frames fit perfectly in the available data (97935/97936 bits consumed)
+### Key Discovery: Packed Run-Level AC Coding
+The AC coding breakthrough came from analyzing the value distribution: |1|=43.8%, |2|=16.4%, |3|=11.7%, then a sharp drop to |4|=2.4%. This pattern exactly matches a packed run-level code with 3 levels per run group:
+- |v| = 1..3 → run=0 (coefficient at current position)
+- |v| = 4..6 → run=1 (skip 1 zero)
+- The sharp drop at |4| corresponds to the transition from "no skip" to "skip 1 zero"
 
-Previous models (run-level coding with dual EOB, per-block coding) all produced colored-dot artifacts because they consumed the wrong number of bits per block, causing desynchronization across subsequent blocks and frames.
+Values like 71 and 99, previously inexplicable "outliers", now decode naturally: 71 → skip 23 zeros, place level ±2.
+
+**Validation**: Multi-frame decode consumes exactly 100% of packet bits (97935/97936 for a 12282-byte packet). Frame sizes are balanced (~33% each for 3-frame packets). Each frame has distinct, plausible scene colors. The interleaved DC+AC model was explicitly ruled out (produces wrong colors).
 
 ### DC-Only Test
-Rendering with DC coefficients only produces clean, recognizable images (blocky but correct colors). Adding AC with the sequential VLC model and ±4 clamping adds subtle detail without introducing artifacts. This confirms the DC DPCM scheme is correct and the AC section follows immediately after.
+Rendering with DC coefficients only produces clean, recognizable images (blocky but correct colors). Adding AC with the rl3 model adds visible scene detail (edges, textures, building shapes). Chroma AC must be discarded (applying it produces rainbow noise).
 
 ### Models Ruled Out (50+ tested)
 - Run-level coding with 6-bit EOB + unary run + VLC level — produces artifacts
@@ -227,8 +247,8 @@ Rendering with DC coefficients only produces clean, recognizable images (blocky 
 See git history for the full set of ~80 test tools in `tools/`.
 
 ## Open Questions
-1. **AC outlier values (~33%)**: About one-third of AC VLC-decoded values have |level| > 3, uniformly distributed across all zigzag positions and block types. Unclamped Y blocks reveal real image detail, confirming the VLC values contain genuine AC information. The true AC coding likely involves additional structure that would eliminate these outliers. Possible explanations: different VLC table for AC, embedded run-length coding, or an additional coding layer.
-2. **QS purpose**: The quantization scale byte (header[3], range 4–40) does NOT participate in AC dequantization — raw VLC values work directly as DCT coefficients. QS may control encoder-side quantization without being needed for decoding, or may be used in a more complex formula once the AC outlier issue is resolved.
-3. **Qtable purpose**: The 16-entry qtable is constant across all games and all QS values (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`). Does not currently participate in decoding. May be used in a dequantization step once the true AC coding is understood.
+1. **AC dequantization formula**: The current fixed multiplier (×32) produces visible scene content but with some noise. The true formula likely involves the qtable (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`, values 10–37) as a frequency-dependent weighting factor. Candidates: `level × qt[k%16]`, `level × QS × qt[k%16] / divisor`, or MPEG-1-style `(2×level+1) × QS × qt[k] / 32`. The challenge is finding a formula that works consistently across QS=7 (few AC values) and QS=36 (many AC values).
+2. **Chroma AC**: Chroma blocks have AC data in the bitstream (using the same rl3 packed run-level coding) but applying it produces rainbow noise. Either chroma AC uses a very different (much smaller) dequant multiplier, or chroma is genuinely DC-only and the "chroma AC" bits serve a different structural purpose.
+3. **Qtable purpose**: The 16-entry qtable is constant across all games. It repeats with period 16 across the 64 zigzag positions (qt[k%16]). Not yet used in decoding. May provide frequency-dependent scaling.
 4. **Byte [39] purpose**: Common values 0x00, 0x01, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata or scene flags.
 5. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found. The codec may be I-frame only (appropriate for 1994 hardware at 256×144@15fps).

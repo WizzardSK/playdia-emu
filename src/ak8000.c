@@ -268,12 +268,15 @@ void ak8000_tick(AK8000 *v) {
 //  Each frame in the bitstream:
 //    1. DC section: 864 DC coefficients via per-component DPCM
 //       using MPEG-1 luminance DC VLC (extended to sizes 0-16)
-//    2. AC section: 864 blocks of sequential VLC-coded AC coefficients
+//    2. AC section: 864 blocks of packed run-level coded AC coefficients
 //       - Same VLC table as DC; value 0 ("100") = end-of-block
-//       - Coefficients in zigzag positions 1,2,3,...
-//       - Typical values are small (±1..±4); larger values clamped
-//       - (AC coding not yet fully reverse-engineered)
+//       - |v|-1 encodes (run, level): run=(|v|-1)/3, level=((|v|-1)%3)+1
+//       - |v|=1..3 → run=0 (coefficient at current position)
+//       - |v|>3 → skip zero-run positions, then place coefficient
+//       - Position overflow (>=64) = implicit end-of-block
+//       - Chroma AC data exists but is discarded (DC-only for Cb/Cr)
 //    3. Frames packed back-to-back, no alignment needed
+//    4. 2-4 frames per packet depending on content complexity
 //
 //  Resolution: 256×144, YCbCr 4:2:0, 16×9 macroblocks = 864 blocks
 //  IDCT: standard orthonormal 8×8 DCT, pixel = IDCT(coeff) + 128
@@ -416,23 +419,38 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64]) {
 dc_done:
     if (dc_count < 6) return 0;
 
-    // AC section: sequential VLC per coefficient position
-    // Each block: VLC values for positions 1,2,3,...; value 0 = end-of-block
-    // The VLC-decoded levels use the same MPEG-1 DC size table.
-    // Raw VLC values are used directly as DCT coefficients (no QS multiply).
-    // ~33% of values are outliers — clamp differently for Y vs Cb/Cr:
-    //   Y (luma):  clamp to ±32 — allows real detail through, luma noise is subtle
-    //   Cb/Cr:     clamp to ±4  — prevents visible colored-dot artifacts
-    #define PD_AC_CLAMP_Y  32
-    #define PD_AC_CLAMP_C   4
+    // AC section: packed run-level VLC coding
+    // Each VLC value encodes a (run, level) pair:
+    //   0          = end-of-block
+    //   |v| = 1..3 = run=0, level=|v| at current position
+    //   |v| > 3    = run=(|v|-1)/3, level=((|v|-1)%3)+1
+    //   sign preserved from VLC sign
+    // Position advances by run, then coefficient placed at that position.
+    // If position >= 64, implicit end-of-block (overflow).
+    //
+    // Chroma blocks have AC data in the bitstream but it's read and
+    // discarded — only luma (Y) AC is applied. Chroma uses DC only.
+    //
+    // Dequantization: level × 32 (fixed multiplier for Y blocks).
+    // This is QS-independent; QS controls encoder-side quantization
+    // aggressiveness (fewer coefficients at low QS) but the dequant
+    // scaling is constant.
+    #define PD_AC_DEQUANT  32
     for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
-        int clamp_val = (b % 6 < 4) ? PD_AC_CLAMP_Y : PD_AC_CLAMP_C;
-        for (int k = 1; k < 64 && bs->pos < bs->total_bits - 2; k++) {
-            int level = pd_read_vlc(bs);
-            if (level == -9999 || level == 0) break;  // EOB or error
-            if (level > clamp_val) level = clamp_val;
-            else if (level < -clamp_val) level = -clamp_val;
-            coeff[b][k] = level;
+        int is_chroma = (b % 6 >= 4);
+        int k = 1;
+        while (k < 64 && bs->pos < bs->total_bits - 2) {
+            int val = pd_read_vlc(bs);
+            if (val == -9999 || val == 0) break;  // EOB or error
+            int sign = (val > 0) ? 1 : -1;
+            int av = (val > 0) ? val : -val;
+            int run   = (av - 1) / 3;
+            int level = ((av - 1) % 3) + 1;
+            k += run;
+            if (k >= 64) break;  // overflow = implicit EOB
+            if (!is_chroma)
+                coeff[b][k] = sign * level * PD_AC_DEQUANT;
+            k++;
         }
     }
 
