@@ -128,6 +128,27 @@ Tested MPEG-1 Table B.14 AC VLC with 5 different block/macroblock configurations
 All hypotheses hit VLC decode errors well before consuming the full bitstream.
 **The codec does NOT use MPEG-1 AC VLC tables in any block organization.**
 
+#### 2-Pass Per-Position Flag+VLC (MPEG-1 DC VLC for AC values)
+- Scheme: 2 passes × 864 blocks × 63 zigzag positions; flag=0→zero, flag=1→read VLC, VLC=0→EOB
+- **Real data: 100.0%, Random data: 98.3%** — indistinguishable
+- Band NZ roll-off present in BOTH real and random (artifact of sequential scanning)
+- Per-band ratio INVERTED: real has fewer NZ at low frequencies than random
+- AC adds noise to image, not detail — flat DC + AC produces uniform gray with random pixels
+- N-pass sweep: 1=51%, 2=100%, 3+=100% for real; random saturates at N=3
+- **SELF-CALIBRATING → RULED OUT**
+
+#### Unary-run + Sign+7bit Level, EOB = 6 zero bits (BEST LEAD)
+- Scheme: peek 6 bits, if 000000→EOB; else count leading zeros→run, then 1+sign+7bit magnitude→level
+- **Real data: 864/864 blocks, 99.1% consumed**
+- **Random data: 375/864 blocks (43%)** — strongest differentiation found (2.3× ratio)
+- Band NZ: real shows frequency roll-off (pos 1: 409, pos 60: 33); random uniform (193→114)
+- **NOT self-calibrating** — first scheme to show strong real-vs-random signal
+- **HOWEVER**: inconsistent across frames — works for f00 (QS=13), f06 (QS=10), aqua (QS=13); fails for f04 (QS=11, 835/864) and f08 (QS=8, 481/864)
+- Parameter sweep: eob=3-5 with any lb always gives 864 blocks at 20-60% consumption (self-calibrating); eob=6 with lb=8 is the only data-dependent sweet spot; eob=7+ self-calibrates again at 100%
+- All rendered images show noise/bands — no recognizable content in any DC/dequant mode
+- **Extra `00 80` byte patterns** in some frames are NOT sub-chunk markers — confirmed absent from f04/f06/f08
+- **PARTIALLY PROMISING but level encoding likely wrong or incomplete**
+
 ### Models tested and RULED OUT
 
 #### JPEG Standard AC Huffman (Annex K, Table K.5)
@@ -260,13 +281,19 @@ Tested DC (7-9 bits) + 16 AC (5-8 bits) fixed-width signed coefficients with IDC
 1. **AK8000 is a custom ASIC** — ~50% of Asahi Kasei's IC sales were custom-designed.
    No datasheet, no patents found. No one has previously reverse-engineered this codec.
    Web search confirmed: NO existing Playdia emulation, no AK8000 documentation anywhere online.
-2. **Arithmetic/range coding** — explains high entropy, but rare in 1994 hardware
-3. **Proprietary VLC table** stored in AK8000 ROM — impossible to determine without decap
-4. **Golomb-Rice k=6 (truncated)** — would produce codes with unary prefix up to 6 bits
+2. **Unary-run + variable-length level** — the EOB=6 zeros scheme (2.3× real-vs-random) is the
+   strongest lead. The run encoding (unary) may be correct while the level encoding is wrong.
+   Level may use VLC (Exp-Golomb, Huffman, or custom) instead of fixed 8-bit.
+3. **Arithmetic/range coding** — explains high entropy, but rare in 1994 hardware
+4. **Proprietary VLC table** stored in AK8000 ROM — impossible to determine without decap
+5. **Golomb-Rice k=6 (truncated)** — would produce codes with unary prefix up to 6 bits
    + 6-bit fixed suffix = 12 max length, matching the run-length fingerprint
-5. **Non-standard coefficient ordering** — maybe not zigzag but some other scan order
-6. **Separate coding for different frequency bands** — different scheme for low vs high AC
-7. **Only 16 AC coefficients coded** — qtable size matches, but coding scheme unknown
+6. **Non-standard coefficient ordering** — maybe not zigzag but some other scan order
+7. **Separate coding for different frequency bands** — different scheme for low vs high AC
+8. **Only 16 AC coefficients coded** — qtable size matches, but coding scheme unknown
+9. **CD-i DYUV-style pixel-domain coding** — Video DAC is Philips TDA8772AH (same as CD-i).
+   97936 bits / 55296 pixels = 1.77 bits/pixel. Possible with Huffman-coded deltas.
+10. **Chip decap** — may be the only way to extract the VLC table from the AK8000 ROM
 
 ## Test Games
 | Game | Video LBAs | Notes |
