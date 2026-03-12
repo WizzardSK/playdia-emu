@@ -373,34 +373,44 @@ static void pd_dequant_ac(int coeff[64], int qscale, const uint8_t qtable[16]) {
     }
 }
 
-// Reference 8×8 IDCT (orthonormal, separable)
+// Integer 8×8 IDCT using precomputed cosine matrix (no cos()/sqrt() at runtime)
+// C[k][n] = cos((2n+1)*k*pi/16) * 2048, k=0 scaled by 1/sqrt(2)
+// k=0 row scaled by 1/sqrt(2) for orthonormal DCT
+static const int16_t pd_cos[8][8] = {
+    { 1448, 1448, 1448, 1448, 1448, 1448, 1448, 1448}, // k=0: 2048/sqrt(2)
+    { 2009, 1703, 1138,  400, -400,-1138,-1703,-2009}, // k=1
+    { 1892,  784, -784,-1892,-1892, -784,  784, 1892}, // k=2
+    { 1703, -400,-2009,-1138, 1138, 2009,  400,-1703}, // k=3
+    { 1448,-1448,-1448, 1448, 1448,-1448,-1448, 1448}, // k=4
+    { 1138,-2009,  400, 1703,-1703, -400, 2009,-1138}, // k=5
+    {  784,-1892, 1892, -784, -784, 1892,-1892,  784}, // k=6
+    {  400,-1138, 1703,-2009, 2009,-1703, 1138, -400}, // k=7
+};
+
 static void pd_idct_block(const int coeff[64], uint8_t out[8][8]) {
-    double temp[8][8];
     int matrix[8][8];
     memset(matrix, 0, sizeof(matrix));
     for (int i = 0; i < 64; i++)
         matrix[pd_zigzag[i] / 8][pd_zigzag[i] % 8] = coeff[i];
 
-    // Row transform
+    int temp[8][8];
+
+    // Row transform: temp[i][j] = sum_k(matrix[i][k] * cos[k][j]) / (2*2048)
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
-            double sum = 0;
-            for (int k = 0; k < 8; k++) {
-                double c = (k == 0) ? (1.0 / sqrt(2.0)) : 1.0;
-                sum += c * matrix[i][k] * cos((2 * j + 1) * k * M_PI / 16.0);
-            }
-            temp[i][j] = sum / 2.0;
+            int sum = 0;
+            for (int k = 0; k < 8; k++)
+                sum += matrix[i][k] * pd_cos[k][j];
+            temp[i][j] = (sum + 2048) >> 12;
         }
     }
     // Column transform + level shift
     for (int j = 0; j < 8; j++) {
         for (int i = 0; i < 8; i++) {
-            double sum = 0;
-            for (int k = 0; k < 8; k++) {
-                double c = (k == 0) ? (1.0 / sqrt(2.0)) : 1.0;
-                sum += c * temp[k][j] * cos((2 * i + 1) * k * M_PI / 16.0);
-            }
-            out[i][j] = (uint8_t)pd_clamp((int)round(sum / 2.0) + 128);
+            int sum = 0;
+            for (int k = 0; k < 8; k++)
+                sum += temp[k][j] * pd_cos[k][i];
+            out[i][j] = (uint8_t)pd_clamp(((sum + 2048) >> 12) + 128);
         }
     }
 }
