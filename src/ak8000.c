@@ -54,6 +54,7 @@ void ak8000_reset(AK8000 *v) {
     v->frame_count = 0; v->got_video_frame = false;
     v->vid_es_len  = v->aud_es_len = 0;
     v->audio_write_pos = v->audio_read_pos = 0;
+    v->fq_write = v->fq_read = v->fq_count = 0;
 }
 
 void ak8000_free(AK8000 *v) {
@@ -239,7 +240,17 @@ void ak8000_feed_sector(AK8000 *v, const uint8_t *sec, int len) {
 void ak8000_tick(AK8000 *v) {
     if (v->vid_es_len > 0) flush_video_es(v);
     if (v->aud_es_len > 0) flush_audio_es(v);
+
+    // Pop one frame from queue into display framebuffer
     v->got_video_frame = false;
+    if (v->fq_count > 0) {
+        memcpy(v->framebuffer, v->frame_queue[v->fq_read],
+               SCREEN_W * SCREEN_H * 3);
+        v->fq_read = (v->fq_read + 1) % PD_FRAME_QUEUE_SIZE;
+        v->fq_count--;
+        v->got_video_frame = true;
+        v->vid_frame_ready = true;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -519,25 +530,52 @@ static void playdia_decode_video_frame(AK8000 *v) {
             }
         }
 
-        // YCbCr → RGB888 into framebuffer (centered in 320×240)
-        int ox = (SCREEN_W - PD_W) / 2;
-        int oy = (SCREEN_H - PD_H) / 2;
-        memset(v->framebuffer, 0, SCREEN_W * SCREEN_H * 3);
+        // Deblocking: smooth 8×8 block boundaries in Y/Cb/Cr planes
+        // Strong 3-tap filter: threshold=2, adj=d/3
+        #define PD_DEBLOCK(plane, h, w, step) do { \
+            for (int _by = step; _by < (h); _by += step) \
+                for (int _x = 0; _x < (w); _x++) { \
+                    int _d = (plane)[_by][_x] - (plane)[_by-1][_x]; \
+                    if (_d > 2 || _d < -2) { int _a = _d/3; \
+                        (plane)[_by-1][_x] = (uint8_t)pd_clamp((plane)[_by-1][_x] + _a); \
+                        (plane)[_by][_x]   = (uint8_t)pd_clamp((plane)[_by][_x] - _a); } \
+                } \
+            for (int _y = 0; _y < (h); _y++) \
+                for (int _bx = step; _bx < (w); _bx += step) { \
+                    int _d = (plane)[_y][_bx] - (plane)[_y][_bx-1]; \
+                    if (_d > 2 || _d < -2) { int _a = _d/3; \
+                        (plane)[_y][_bx-1] = (uint8_t)pd_clamp((plane)[_y][_bx-1] + _a); \
+                        (plane)[_y][_bx]   = (uint8_t)pd_clamp((plane)[_y][_bx] - _a); } \
+                } \
+        } while(0)
+        PD_DEBLOCK(Y,  PD_H,     PD_W,     8);
+        PD_DEBLOCK(Cb, PD_H / 2, PD_W / 2, 8);
+        PD_DEBLOCK(Cr, PD_H / 2, PD_W / 2, 8);
+        #undef PD_DEBLOCK
 
-        for (int y = 0; y < PD_H; y++) {
-            for (int x = 0; x < PD_W; x++) {
-                int yv = Y[y][x];
-                int cb = Cb[y / 2][x / 2] - 128;
-                int cr = Cr[y / 2][x / 2] - 128;
-                int dst = ((y + oy) * SCREEN_W + (x + ox)) * 3;
-                v->framebuffer[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
-                v->framebuffer[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
-                v->framebuffer[dst + 2] = (uint8_t)pd_clamp(yv + (int)(1.772 * cb));
+        // YCbCr → RGB888 into frame queue (centered in 320×240)
+        if (v->fq_count < PD_FRAME_QUEUE_SIZE) {
+            uint8_t *dst_buf = v->frame_queue[v->fq_write];
+            int ox = (SCREEN_W - PD_W) / 2;
+            int oy = (SCREEN_H - PD_H) / 2;
+            memset(dst_buf, 0, SCREEN_W * SCREEN_H * 3);
+
+            for (int y = 0; y < PD_H; y++) {
+                for (int x = 0; x < PD_W; x++) {
+                    int yv = Y[y][x];
+                    int cb = Cb[y / 2][x / 2] - 128;
+                    int cr = Cr[y / 2][x / 2] - 128;
+                    int dst = ((y + oy) * SCREEN_W + (x + ox)) * 3;
+                    dst_buf[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
+                    dst_buf[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
+                    dst_buf[dst + 2] = (uint8_t)pd_clamp(yv + (int)(1.772 * cb));
+                }
             }
+
+            v->fq_write = (v->fq_write + 1) % PD_FRAME_QUEUE_SIZE;
+            v->fq_count++;
         }
 
-        v->got_video_frame = true;
-        v->vid_frame_ready = true;
         v->frame_count++;
         frames_decoded++;
 

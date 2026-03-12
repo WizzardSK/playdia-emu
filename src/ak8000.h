@@ -94,6 +94,13 @@ typedef struct AK8000 {
     uint8_t  qscale;                 // quantization scale factor
     int      dc_pred[3];             // DC DPCM predictors (Y, Cb, Cr)
 
+    // ── Frame queue (multi-frame packets produce 2-4 frames) ──
+    #define PD_FRAME_QUEUE_SIZE 8
+    uint8_t  frame_queue[PD_FRAME_QUEUE_SIZE][SCREEN_W * SCREEN_H * 3];
+    int      fq_write;               // next write slot
+    int      fq_read;                // next read slot
+    int      fq_count;               // frames in queue
+
     // ── Interactive FMV state ────────────────────────────────
     bool     interactive_pending;    // F2 command ready for processing
     bool     waiting_for_input;     // paused waiting for player button

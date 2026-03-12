@@ -122,10 +122,16 @@ int pipeline_run_frame(Pipeline *pl, CDROM *cd, AK8000 *av) {
         cdrom_seek(cd, target);
     }
 
+    // Throttle: don't feed more sectors if frame queue is nearly full.
+    // This prevents decoding faster than we can display.
+    if (av->fq_count >= PD_FRAME_QUEUE_SIZE - 2) return 0;
+
     int fed = 0;
     for (int i = 0; i < PIPE_SECTORS_PER_FRAME; i++) {
         // Stop feeding if an interactive command was just parsed
         if (av->interactive_pending) break;
+        // Stop feeding if queue filled during this batch
+        if (av->fq_count >= PD_FRAME_QUEUE_SIZE - 1) break;
 
         if (cdrom_stream_tick(cd) && cd->sector_ready)
             fed += route_sector(pl, cd, av, NULL, 0);
