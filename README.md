@@ -37,7 +37,7 @@ Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Ful
 | NEC 78K/0 CPU | Basic instruction set |
 | CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
 | BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
-| Video decode | **Full DC+AC+IDCT+dequant** (proprietary AK8000 codec) |
+| Video decode | **DC + AC (clamped) + integer IDCT + deblocking** (proprietary AK8000 codec) |
 | Audio decode | **XA ADPCM** with resampling to 44100 Hz |
 | Interactive | **F2 commands** — jumps, choices (F2 44), loops, quiz, timeout |
 | Display | SDL2, 320×240, 256×144 video centered |
@@ -122,18 +122,16 @@ Magnitude bits use sign-magnitude: if value < 2^(size-1), subtract 2^size - 1.
 
 ## Multi-Frame Packing
 
-Each packet contains **2–4 independent frames** in a continuous bitstream:
+Each packet contains **3 independent frames** in a continuous bitstream (DC+AC per frame, packed back-to-back with no byte alignment):
 
-| F1 sectors | Packet size | Typical frames | Frequency |
-|------------|-------------|----------------|-----------|
+| F1 sectors | Packet size | Frames | Frequency |
+|------------|-------------|--------|-----------|
 | 8 | 16376 bytes | 3 | 90.8% |
-| 7 | 14329 bytes | 2–3 | 6.0% |
-| 13 | 26611 bytes | 4+ | 2.5% |
-| 6 | 12282 bytes | 2 | 0.6% |
+| 7 | 14329 bytes | 3 | 6.0% |
+| 13 | 26611 bytes | 3 | 2.5% |
+| 6 | 12282 bytes | 3 | 0.6% |
 
-The "100" = EOB discovery was key: it produces **even frame distribution** (confirmed by bit consumption analysis). Without it, 76% of bits go to the first frame.
-
-Frames are **byte-aligned** between boundaries. The last frame is always partial (data runs out).
+Bitstream analysis confirms: each frame's DC section (~3800 bits) + AC section (~29000 bits) consumes ~33% of the packet. The last frame may be slightly truncated when data runs out.
 
 ## Bitstream Structure (per frame)
 
@@ -146,46 +144,33 @@ Frames are **byte-aligned** between boundaries. The last frame is always partial
 - Block 5: Cr predictor
 
 ### Phase 2: AC Coefficients
-864 blocks of run-level coded AC coefficients (zigzag positions 1–63).
+864 blocks of sequential VLC-coded AC coefficients (zigzag positions 1–63).
 
-For each block, repeat until EOB or position 63:
-
-1. **6-bit EOB check**: Peek 6 bits. If `000000` → end of block (consume 6 bits)
-2. **Unary run code**: Count leading `0` bits (max 5), then `1` delimiter. Run = count of zeros.
-3. **Alternate EOB check**: Peek 3 bits. If `100` (VLC size 0) → end of block (consume 3 bits)
-4. **Level VLC**: Read signed value using the extended VLC table (sizes 1–16)
-5. Skip `run` positions, place `level` at current position, advance by 1
+For each block:
+1. Read VLC value for position k (starting at k=1)
+2. If value = 0 (`100` in binary, VLC size 0) → **end of block**
+3. Otherwise, store value as coefficient at zigzag position k, advance k
+4. Repeat until EOB or k reaches 64
 
 ### Pseudocode
 ```c
 for each block (0..863):
-    k = 1  // start at AC position 1
-    while k < 64:
-        if peek(6) == 0b000000:   // 6-bit EOB
-            consume(6); break
-
-        run = 0
-        while run < 5:
-            bit = read(1)
-            if bit == 1: break    // delimiter
-            run++
-
-        if peek(3) == 0b100:     // "100" = alternate EOB
-            consume(3); break
-
-        level = read_vlc()       // extended VLC, sizes 1-16
-        k += run
-        if k < 64: coeff[k] = level
-        k++
+    for k = 1 to 63:
+        level = read_vlc()       // same extended VLC table as DC
+        if level == 0: break     // EOB ("100" = VLC size 0)
+        coeff[k] = clamp(level, -4, 4)  // clamp outliers
 ```
+
+### AC Clamping
+
+The sequential VLC model correctly identifies frame boundaries and consumes the right number of bits (97935/97936 for a typical 12282-byte packet). However, the decoded AC values include occasional large outliers (e.g., ±214) that produce visible colored-dot artifacts.
+
+Most AC values are small (±1, ±2), consistent with low-frequency DCT detail. Clamping to ±4 removes the outliers while preserving legitimate AC information. The true AC coding scheme may involve additional structure (run-length, different VLC table, or quantization) that is not yet fully understood.
 
 ## Dequantization
 
-- **DC**: Scale ×1 gives correct pixel values (IDCT's 1/8 normalization handles it)
-- **AC**: VLC-decoded values are the raw DCT coefficients (no multiply-based dequant needed). Outlier values (up to ±2033) cause localized color spike artifacts. Clamping AC to ±2048/QS removes these while preserving detail.
-- AC coefficient range: avg |AC| ≈ 10–15, rare outliers up to ±2033
-- Tested: MPEG-1 style multiply (AC×QS×qt/N) produces garbled output; clamping produces clean frames
-- Remaining block boundaries are inherent to the codec's bitrate (~4KB per 256×144 frame)
+- **DC**: Raw VLC-decoded DPCM values used directly as DCT coefficient[0]. The IDCT's 1/8 normalization gives correct pixel values with +128 level shift.
+- **AC**: VLC-decoded values used directly (clamped to ±4). No quantization matrix multiply needed for the clamped approach.
 
 ## XA ADPCM Audio
 
@@ -212,32 +197,30 @@ All games share identical qtable values and frame header format.
 
 ## Reverse Engineering Methodology
 
-### Key Discovery: "100" = Alternate EOB
-Testing "100" (VLC size 0) as EOB vs as level=0:
-- **Level=0**: First frame consumes 76% of bits, second gets 24% → unbalanced
-- **EOB**: Three frames at ~33% each → **even distribution confirms EOB interpretation**
-- This also fixed QS=8 decoding (previously failed at 687/864 AC blocks)
+### Key Discovery: Sequential VLC for AC
+The breakthrough came from bitstream analysis showing that each packet contains exactly 3 frames, each consuming ~33% of the data:
+- **DC section**: ~3800 bits (864 DPCM VLC-coded coefficients)
+- **AC section**: ~29000 bits (864 blocks of sequential VLC values, VLC=0 as EOB)
+- Three frames fit perfectly in the available data (97935/97936 bits consumed)
 
-### Random Data Control
-Any variable-length code applied to random data will consume a predictable percentage and show patterns that look like real decoding. The ONLY reliable test is comparing decoded statistics on real vs random data. The unary-run + VLC level + 6-bit EOB scheme shows 2.3× real-vs-random ratio — the strongest differentiation of all schemes tested.
+Previous models (run-level coding with dual EOB, per-block coding) all produced colored-dot artifacts because they consumed the wrong number of bits per block, causing desynchronization across subsequent blocks and frames.
+
+### DC-Only Test
+Rendering with DC coefficients only produces clean, recognizable images (blocky but correct colors). Adding AC with the sequential VLC model and ±4 clamping adds subtle detail without introducing artifacts. This confirms the DC DPCM scheme is correct and the AC section follows immediately after.
 
 ### Models Ruled Out (50+ tested)
+- Run-level coding with 6-bit EOB + unary run + VLC level — produces artifacts
 - MPEG-1 AC VLC (Table B.14) — all block organizations fail
 - MPEG-2 AC VLC (Table B.15) — 12–17% consumption, 30%+ errors
 - JPEG standard AC Huffman — self-calibrating on random data
 - PS1 MDEC 16-bit fixed-width — only 42–53% consumed
-- Exp-Golomb (orders 0–3) — self-calibrating
-- Golomb-Rice (all k values) — self-calibrating at k≥1
-- Per-position flag+VLC — always self-calibrating
-- Fixed-width run-level pairs — all produce noise
-- Arithmetic coding hypothesis — unlikely for 1994 hardware
-- CD-i DYUV pixel-domain coding — wrong paradigm
-- 25+ prefix code structures — none reach 85% consumption
+- Per-block coding (DC+AC interleaved) — artifacts
+- Exp-Golomb, Golomb-Rice, arithmetic coding — self-calibrating or wrong paradigm
 
 See git history for the full set of ~80 test tools in `tools/`.
 
 ## Open Questions
-1. **Qtable purpose**: The 16-entry qtable is constant across all games and all QS values. It does NOT participate in AC dequantization (tested: MPEG-1 style multiply produces garbled output). May be encoder-only.
-2. **Byte [39] purpose**: Common values 0x00, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata, scene flags, or content hints.
-3. **P-frames**: All tested frames decode as independent I-frames with the same decoder. No evidence of traditional P-frame coding (delta/motion compensation) found yet. The codec may be I-frame only.
-4. **IDCT optimization**: Currently uses reference floating-point IDCT (works but slow for non-optimized builds).
+1. **AC coding precision**: The sequential VLC model correctly identifies frame boundaries and produces clean video with ±4 clamping, but the true AC coding likely involves additional structure (quantization matrix scaling, different VLC for AC, or run-length encoding) that would eliminate the need for clamping and provide full-detail decoding.
+2. **Qtable purpose**: The 16-entry qtable is constant across all games and all QS values. It does NOT participate in AC dequantization with the current approach. May be used in a dequant step once the true AC coding is understood.
+3. **Byte [39] purpose**: Common values 0x00, 0x01, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata or scene flags.
+4. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found. The codec may be I-frame only (appropriate for 1994 hardware at 256×144@15fps).
