@@ -397,7 +397,7 @@ static void pd_idct_block(const int coeff[64], uint8_t out[8][8]) {
 
 // Decode one video frame from the bitstream
 // Returns number of DC blocks decoded (864 on success), 0 on failure
-static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64]) {
+static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64], int qscale) {
     int dc_count = 0;
     memset(coeff, 0, sizeof(int) * PD_NBLOCKS * 64);
 
@@ -419,17 +419,20 @@ dc_done:
     // AC section: sequential VLC per coefficient position
     // Each block: VLC values for positions 1,2,3,...; value 0 = end-of-block
     // The VLC-decoded levels use the same MPEG-1 DC size table.
-    // Clamp AC values to ±4 — the codec produces mostly ±1/±2 with
-    // occasional large outliers that are likely VLC misalignment artifacts.
-    // (The true AC coding scheme is not yet fully reverse-engineered.)
-    #define PD_AC_CLAMP 4
+    // Dequantize: multiply raw VLC level by QS (quantization scale), then
+    // clamp the result to ±PD_AC_CLAMP. This gives consistent detail across
+    // all QS values while suppressing outlier artifacts from the ~33% of AC
+    // values that appear to be decode errors in the not-yet-fully-understood
+    // AC coding scheme.
+    #define PD_AC_CLAMP 8
     for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
         for (int k = 1; k < 64 && bs->pos < bs->total_bits - 2; k++) {
             int level = pd_read_vlc(bs);
             if (level == -9999 || level == 0) break;  // EOB or error
-            if (level > PD_AC_CLAMP) level = PD_AC_CLAMP;
-            else if (level < -PD_AC_CLAMP) level = -PD_AC_CLAMP;
-            coeff[b][k] = level;
+            int dq = level * qscale;
+            if (dq > PD_AC_CLAMP) dq = PD_AC_CLAMP;
+            else if (dq < -PD_AC_CLAMP) dq = -PD_AC_CLAMP;
+            coeff[b][k] = dq;
         }
     }
 
@@ -466,7 +469,7 @@ static void playdia_decode_video_frame(AK8000 *v) {
     int frames_decoded = 0;
 
     while (bs.pos < total_bits - 16) {
-        int dc_count = pd_decode_one_frame(&bs, frame_coeff);
+        int dc_count = pd_decode_one_frame(&bs, frame_coeff, qscale);
         if (dc_count < 6) break;
 
         // IDCT + render to Y/Cb/Cr planes
