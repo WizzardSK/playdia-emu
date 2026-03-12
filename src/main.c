@@ -76,6 +76,17 @@ static void run_headless(Playdia *p, uint32_t max_frames) {
             printf("[Headless] frame=%u  ~%.1fs\n", f, f / 30.0f);
     }
     printf("[Headless] Done. %u frames total.\n", p->frames);
+    // Save last framebuffer as PPM
+    {
+        FILE *f = fopen("/tmp/pd_headless.ppm", "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", SCREEN_W, SCREEN_H);
+            fwrite(p->video.framebuffer, SCREEN_W * SCREEN_H * 3, 1, f);
+            fclose(f);
+            (void)!system("convert /tmp/pd_headless.ppm /tmp/pd_headless.png 2>/dev/null");
+            printf("[Headless] Saved framebuffer to /tmp/pd_headless.png\n");
+        }
+    }
     playdia_dump(p);
 }
 

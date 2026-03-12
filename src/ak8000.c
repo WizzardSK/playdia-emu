@@ -431,11 +431,12 @@ dc_done:
     // Chroma blocks have AC data in the bitstream but it's read and
     // discarded — only luma (Y) AC is applied. Chroma uses DC only.
     //
-    // Dequantization: level × 32 (fixed multiplier for Y blocks).
-    // This is QS-independent; QS controls encoder-side quantization
-    // aggressiveness (fewer coefficients at low QS) but the dequant
-    // scaling is constant.
-    #define PD_AC_DEQUANT  32
+    // Dequantization: level × 16 (fixed multiplier for Y blocks).
+    // DC values span ±800–1900 across a frame; the IDCT's 1/8
+    // normalization maps these to proper 0–255 pixel range.
+    // AC at ×16 provides proportional within-block detail.
+    // QS-independent: QS controls encoder-side quantization only.
+    #define PD_AC_DEQUANT  16
     for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
         int is_chroma = (b % 6 >= 4);
         int k = 1;

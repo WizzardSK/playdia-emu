@@ -180,7 +180,7 @@ for each block (0..863):
         k += run                  // skip zeros
         if k >= 64: break         // overflow = implicit EOB
         if is_luma_block:
-            coeff[k] = sign * level * 32  // fixed dequant
+            coeff[k] = sign * level * 16  // fixed dequant
         k++
 ```
 
@@ -195,7 +195,7 @@ The packed run-level model is validated by multi-frame decoding:
 ## Dequantization
 
 - **DC**: Raw VLC-decoded DPCM values used directly as DCT coefficient[0]. The IDCT's 1/8 normalization gives correct pixel values with +128 level shift.
-- **AC**: `sign × level × 32` (fixed multiplier, Y blocks only). The dequant is QS-independent — QS controls encoder-side quantization aggressiveness (fewer non-zero coefficients at low QS) but the decoder uses a constant scaling factor.
+- **AC**: `sign × level × 16` (fixed multiplier, Y blocks only). The dequant is QS-independent — QS controls encoder-side quantization aggressiveness but the decoder uses a constant scaling factor. DC values span ±800–1900 (full frame), which the IDCT's 1/8 normalization maps to ~0–255 pixels. AC at ×16 provides within-block detail (gradients, edges, textures) at proportional scale.
 
 ## XA ADPCM Audio
 
@@ -247,8 +247,8 @@ Rendering with DC coefficients only produces clean, recognizable images (blocky 
 See git history for the full set of ~80 test tools in `tools/`.
 
 ## Open Questions
-1. **AC dequantization formula**: The current fixed multiplier (×32) produces visible scene content but with some noise. The true formula likely involves the qtable (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`, values 10–37) as a frequency-dependent weighting factor. Candidates: `level × qt[k%16]`, `level × QS × qt[k%16] / divisor`, or MPEG-1-style `(2×level+1) × QS × qt[k] / 32`. The challenge is finding a formula that works consistently across QS=7 (few AC values) and QS=36 (many AC values).
+1. **AC dequantization formula**: The current fixed multiplier (×16) produces correct within-block detail (gradients, edges, textures visible when zoomed). Tested alternatives: MPEG-1 `(2×level+1)×QS×qt/32` — too aggressive at high QS (36), produces noise. QS-independent fixed multiplier gives consistent results across all QS values (7–36). The qtable (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`, values 10–37) may provide frequency-dependent refinement but is not required for functional decode. DC values span ±800–1900 across a frame; the IDCT's 1/8 normalization maps these to proper 0–255 pixel range without additional scaling. DC×8 was tested and ruled out (causes massive pixel clamping).
 2. **Chroma AC**: Chroma blocks have AC data in the bitstream (using the same rl3 packed run-level coding) but applying it produces rainbow noise. Either chroma AC uses a very different (much smaller) dequant multiplier, or chroma is genuinely DC-only and the "chroma AC" bits serve a different structural purpose.
-3. **Qtable purpose**: The 16-entry qtable is constant across all games. It repeats with period 16 across the 64 zigzag positions (qt[k%16]). Not yet used in decoding. May provide frequency-dependent scaling.
+3. **Qtable purpose**: The 16-entry qtable is constant across all games. It repeats with period 16 across the 64 zigzag positions (qt[k%16]). Not yet used in decoding. May provide frequency-dependent scaling refinement.
 4. **Byte [39] purpose**: Common values 0x00, 0x01, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata or scene flags.
 5. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found. The codec may be I-frame only (appropriate for 1994 hardware at 256×144@15fps).
