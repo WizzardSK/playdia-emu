@@ -149,6 +149,20 @@ All hypotheses hit VLC decode errors well before consuming the full bitstream.
 - **Extra `00 80` byte patterns** in some frames are NOT sub-chunk markers — confirmed absent from f04/f06/f08
 - **PARTIALLY PROMISING but level encoding likely wrong or incomplete**
 
+#### Cross-frame bit pattern search for EOB candidates
+Searched all 3-8 bit patterns across 3 frames (f00/f06/f08) for counts near valid block counts:
+| Pattern | f00 | f06 | f08 | Target block count |
+|---------|-----|-----|-----|-------------------|
+| 5-bit `00010` | 3194 | 3323 | 3349 | **3456** (4×4 blocks) |
+| 6-bit `111101` | 864 | 986 | 866 | **864** (8×8 blocks) |
+| 7-bit `1000001` | 874 | 927 | 913 | **864** (8×8 blocks) |
+| 7-bit `1111000` | 902 | 794 | 750 | **864** (8×8 blocks) |
+
+**`00010` as 5-bit EOB with unary-run + 4-bit level (8×8 blocks)**:
+- **ALL 5 frames decode 864/864 blocks at 95.9-99.7%** — most consistent result
+- But real-vs-random ratio only 1.18× (weak differentiation)
+- Remaining ~4% bits could be separately-coded DC section
+
 ### Models tested and RULED OUT
 
 #### JPEG Standard AC Huffman (Annex K, Table K.5)
