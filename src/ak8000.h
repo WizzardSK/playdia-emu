@@ -46,8 +46,9 @@ typedef struct AK8000 {
     uint8_t  framebuffer[SCREEN_W * SCREEN_H * 3];
 
     // ── Audio ring buffer (stereo int16) ──────────────────
-    // XA ADPCM: up to 8064 int16 values per sector, need room for several
-    int16_t  audio_buf[SAMPLES_PER_FRAME * CHANNELS * 8];
+    // XA ADPCM: after resampling to 44100Hz, ~5300 stereo pairs per sector
+    // Need room for several sectors worth of audio
+    int16_t  audio_buf[SAMPLES_PER_FRAME * CHANNELS * 16];
     int      audio_write_pos;
     int      audio_read_pos;
 
