@@ -419,23 +419,20 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64]) {
 dc_done:
     if (dc_count < 6) return 0;
 
-    // AC section: packed run-level VLC coding
-    // Each VLC value encodes a (run, level) pair:
-    //   0          = end-of-block
-    //   |v| = 1..3 = run=0, level=|v| at current position
-    //   |v| > 3    = run=(|v|-1)/3, level=((|v|-1)%3)+1
-    //   sign preserved from VLC sign
-    // Position advances by run, then coefficient placed at that position.
-    // If position >= 64, implicit end-of-block (overflow).
+    // AC section: direct sequential VLC coding
+    // Each VLC value is a direct AC coefficient placed at the next zigzag position:
+    //   0   = end-of-block (EOB)
+    //   !=0 = coefficient value × dequant multiplier
+    //
+    // Evidence: direct interpretation produces exactly 864 EOBs per frame
+    // (one per block), while the rl3 run-level model produced only 775 EOBs
+    // + 76 overflows. Direct model also consumes 100% of bitstream across
+    // 3 frames with 0 bits remaining.
     //
     // Chroma blocks have AC data in the bitstream but it's read and
     // discarded — only luma (Y) AC is applied. Chroma uses DC only.
     //
-    // Dequantization: level × 16 (fixed multiplier for Y blocks).
-    // DC values span ±800–1900 across a frame; the IDCT's 1/8
-    // normalization maps these to proper 0–255 pixel range.
-    // AC at ×16 provides proportional within-block detail.
-    // QS-independent: QS controls encoder-side quantization only.
+    // Dequantization: value × 16 (fixed multiplier for Y blocks).
     #define PD_AC_DEQUANT  16
     for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
         int is_chroma = (b % 6 >= 4);
@@ -443,14 +440,8 @@ dc_done:
         while (k < 64 && bs->pos < bs->total_bits - 2) {
             int val = pd_read_vlc(bs);
             if (val == -9999 || val == 0) break;  // EOB or error
-            int sign = (val > 0) ? 1 : -1;
-            int av = (val > 0) ? val : -val;
-            int run   = (av - 1) / 3;
-            int level = ((av - 1) % 3) + 1;
-            k += run;
-            if (k >= 64) break;  // overflow = implicit EOB
             if (!is_chroma)
-                coeff[b][k] = sign * level * PD_AC_DEQUANT;
+                coeff[b][k] = val * PD_AC_DEQUANT;
             k++;
         }
     }
