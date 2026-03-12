@@ -37,7 +37,7 @@ Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Ful
 | NEC 78K/0 CPU | Basic instruction set |
 | CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
 | BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
-| Video decode | **DC + AC (dequant + clamp) + integer IDCT + deblocking** (proprietary AK8000 codec) |
+| Video decode | **DC + AC (split Y/C clamp) + integer IDCT + deblocking** (proprietary AK8000 codec) |
 | Audio decode | **XA ADPCM** with resampling to 44100 Hz |
 | Interactive | **F2 commands** — jumps, choices (F2 44), loops, quiz, timeout |
 | Display | SDL2, 320×240, 256×144 video centered |
@@ -155,27 +155,29 @@ For each block:
 ### Pseudocode
 ```c
 for each block (0..863):
+    is_luma = (block_index % 6 < 4)
+    clamp_val = is_luma ? 32 : 4
     for k = 1 to 63:
         level = read_vlc()       // same extended VLC table as DC
         if level == 0: break     // EOB ("100" = VLC size 0)
-        dq = level * QS              // dequantize by quantization scale
-        coeff[k] = clamp(dq, -8, 8)  // clamp dequantized value
+        coeff[k] = clamp(level, -clamp_val, clamp_val)
 ```
 
-### AC Dequantization and Clamping
+### AC Clamping — Split Y/Cb/Cr
 
 The sequential VLC model correctly identifies frame boundaries and consumes the right number of bits (97935/97936 for a typical 12282-byte packet). However, ~33% of decoded AC values are outliers (|value| > 3), uniformly distributed across all zigzag positions and block types, suggesting an additional coding layer not yet understood.
 
-Most AC values are small (±1, ±2, ±3) — consistent with quantized DCT coefficients. Without dequantization, AC values of ±1 produce zero pixel variation after integer IDCT due to truncation (the orthonormal DCT basis gives ~0.17 pixel per coefficient unit).
+Raw VLC-decoded values are used directly as DCT coefficients (no QS multiplication needed). Testing confirmed that unclamped Y blocks reveal real image detail (scenery, edges), while unclamped Cb/Cr blocks create visible colored-dot artifacts. The split clamping approach:
 
-**Dequantization**: Multiply raw VLC level by QS (quantization scale from header byte [3]). This recovers meaningful DCT coefficient magnitudes — e.g., raw ±1 × QS 7 = ±7, giving ~1.2 pixel variation after IDCT.
+- **Y (luma) blocks**: clamp to ±32 — allows genuine AC detail through the IDCT. Values up to ±32 contribute ~5–6 pixel variation, which is visible as real texture/edges. Luma noise from outlier values manifests as subtle grain rather than colored dots.
+- **Cb/Cr (chroma) blocks**: clamp to ±4 — chroma outliers create highly visible colored dots even at small magnitudes. Tight clamping eliminates these while preserving low-frequency color detail.
 
-**Post-clamp**: Clamp the dequantized value to ±8 to suppress outlier artifacts. This bounds the maximum pixel contribution to ~2 pixels regardless of QS, providing consistent quality across all QS values (tested: QS 7, 15, 18, 36).
+This approach produces consistent quality across all QS values (7–36) without needing QS in the dequantization formula.
 
 ## Dequantization
 
 - **DC**: Raw VLC-decoded DPCM values used directly as DCT coefficient[0]. The IDCT's 1/8 normalization gives correct pixel values with +128 level shift.
-- **AC**: VLC-decoded level × QS, clamped to ±8. The post-clamp approach works across all QS values by bounding the maximum dequantized coefficient.
+- **AC**: Raw VLC values used directly with split Y/C clamping (Y: ±32, Cb/Cr: ±4). No quantization scale multiplication needed — the true role of the QS header byte remains unknown.
 
 ## XA ADPCM Audio
 
@@ -225,7 +227,8 @@ Rendering with DC coefficients only produces clean, recognizable images (blocky 
 See git history for the full set of ~80 test tools in `tools/`.
 
 ## Open Questions
-1. **AC outlier values (~33%)**: About one-third of AC VLC-decoded values have |level| > 3, uniformly distributed across all zigzag positions and block types. The current approach (×QS then post-clamp to ±8) works well visually, but the true AC coding likely involves additional structure that would eliminate these outliers. Possible explanations: different VLC table for AC, embedded run-length coding, or an additional coding layer.
-2. **Qtable purpose**: The 16-entry qtable is constant across all games and all QS values (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`). It does NOT currently participate in dequantization — the ×QS post-clamp approach works without it. May be used in a more precise dequant formula once the AC outlier issue is resolved.
-3. **Byte [39] purpose**: Common values 0x00, 0x01, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata or scene flags.
-4. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found. The codec may be I-frame only (appropriate for 1994 hardware at 256×144@15fps).
+1. **AC outlier values (~33%)**: About one-third of AC VLC-decoded values have |level| > 3, uniformly distributed across all zigzag positions and block types. Unclamped Y blocks reveal real image detail, confirming the VLC values contain genuine AC information. The true AC coding likely involves additional structure that would eliminate these outliers. Possible explanations: different VLC table for AC, embedded run-length coding, or an additional coding layer.
+2. **QS purpose**: The quantization scale byte (header[3], range 4–40) does NOT participate in AC dequantization — raw VLC values work directly as DCT coefficients. QS may control encoder-side quantization without being needed for decoding, or may be used in a more complex formula once the AC outlier issue is resolved.
+3. **Qtable purpose**: The 16-entry qtable is constant across all games and all QS values (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`). Does not currently participate in decoding. May be used in a dequantization step once the true AC coding is understood.
+4. **Byte [39] purpose**: Common values 0x00, 0x01, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata or scene flags.
+5. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found. The codec may be I-frame only (appropriate for 1994 hardware at 256×144@15fps).
