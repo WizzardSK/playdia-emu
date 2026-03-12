@@ -268,11 +268,12 @@ void ak8000_tick(AK8000 *v) {
 //  Each frame in the bitstream:
 //    1. DC section: 864 DC coefficients via per-component DPCM
 //       using MPEG-1 luminance DC VLC (extended to sizes 0-16)
-//    2. AC section: 864 blocks of run-level coded AC coefficients
-//       - 6 zero bits (000000) = end of block
-//       - Unary run code: count leading zeros (max 5) + "1" delimiter
-//       - Level VLC: same extended table; "100" (size 0) = alternate EOB
-//    3. Byte-aligned boundary before next frame
+//    2. AC section: 864 blocks of sequential VLC-coded AC coefficients
+//       - Same VLC table as DC; value 0 ("100") = end-of-block
+//       - Coefficients in zigzag positions 1,2,3,...
+//       - Typical values are small (±1..±4); larger values clamped
+//       - (AC coding not yet fully reverse-engineered)
+//    3. Frames packed back-to-back, no alignment needed
 //
 //  Resolution: 256×144, YCbCr 4:2:0, 16×9 macroblocks = 864 blocks
 //  IDCT: standard orthonormal 8×8 DCT, pixel = IDCT(coeff) + 128
@@ -331,12 +332,6 @@ static int pd_bs_read(pd_bitstream *bs, int n) {
     return v;
 }
 
-static int pd_bs_bit(pd_bitstream *bs) {
-    if (bs->pos >= bs->total_bits) return -1;
-    int bp = bs->pos++;
-    return (bs->data[bp >> 3] >> (7 - (bp & 7))) & 1;
-}
-
 // Read a signed value using the extended MPEG-1 DC VLC table
 static int pd_read_vlc(pd_bitstream *bs) {
     for (int i = 0; i < 17; i++) {
@@ -357,21 +352,6 @@ static int pd_read_vlc(pd_bitstream *bs) {
 
 static int pd_clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
-// AC dequantization — clamp outlier coefficients to reduce block artifacts
-// The VLC-decoded values are the DCT coefficients; large outliers cause
-// visible color spots. Clamping to a reasonable range smooths these out.
-static void pd_dequant_ac(int coeff[64], int qscale, const uint8_t qtable[16]) {
-    (void)qtable;
-    // Clamp AC coefficients: scale inversely with QS
-    // Higher QS = more quantized = coefficients should be smaller
-    int limit = 255;
-    if (qscale > 0) limit = 2048 / qscale;
-    if (limit < 32) limit = 32;
-    for (int i = 1; i < 64; i++) {
-        if (coeff[i] > limit) coeff[i] = limit;
-        else if (coeff[i] < -limit) coeff[i] = -limit;
-    }
-}
 
 // Integer 8×8 IDCT using precomputed cosine matrix (no cos()/sqrt() at runtime)
 // C[k][n] = cos((2n+1)*k*pi/16) * 2048, k=0 scaled by 1/sqrt(2)
@@ -436,37 +416,20 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64]) {
 dc_done:
     if (dc_count < 6) return 0;
 
-    // AC section: run-level coding with dual EOB
-    for (int b = 0; b < dc_count && bs->pos < bs->total_bits; b++) {
-        int k = 1;
-        while (k < 64 && bs->pos < bs->total_bits) {
-            // Check for 6-bit EOB (000000)
-            int peek = pd_bs_peek(bs, 6);
-            if (peek < 0) break;
-            if (peek == 0) { bs->pos += 6; break; }
-
-            // Unary run: count leading zeros (max 5), then "1" delimiter
-            int run = 0;
-            int ok = 1;
-            while (run < 5 && bs->pos < bs->total_bits) {
-                int bit = pd_bs_bit(bs);
-                if (bit < 0) { ok = 0; break; }
-                if (bit == 1) break;
-                run++;
-            }
-            if (!ok) break;
-
-            // Check for "100" = alternate EOB (VLC size 0)
-            int p3 = pd_bs_peek(bs, 3);
-            if (p3 == 4) { bs->pos += 3; break; }
-
-            // Level VLC (sizes 1-16)
+    // AC section: sequential VLC per coefficient position
+    // Each block: VLC values for positions 1,2,3,...; value 0 = end-of-block
+    // The VLC-decoded levels use the same MPEG-1 DC size table.
+    // Clamp AC values to ±4 — the codec produces mostly ±1/±2 with
+    // occasional large outliers that are likely VLC misalignment artifacts.
+    // (The true AC coding scheme is not yet fully reverse-engineered.)
+    #define PD_AC_CLAMP 4
+    for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
+        for (int k = 1; k < 64 && bs->pos < bs->total_bits - 2; k++) {
             int level = pd_read_vlc(bs);
-            if (level == -9999) break;
-
-            k += run;
-            if (k < 64) coeff[b][k] = level;
-            k++;
+            if (level == -9999 || level == 0) break;  // EOB or error
+            if (level > PD_AC_CLAMP) level = PD_AC_CLAMP;
+            else if (level < -PD_AC_CLAMP) level = -PD_AC_CLAMP;
+            coeff[b][k] = level;
         }
     }
 
@@ -506,7 +469,7 @@ static void playdia_decode_video_frame(AK8000 *v) {
         int dc_count = pd_decode_one_frame(&bs, frame_coeff);
         if (dc_count < 6) break;
 
-        // Dequantize AC coefficients, then IDCT
+        // IDCT + render to Y/Cb/Cr planes
         memset(Y, 128, sizeof(Y));
         memset(Cb, 128, sizeof(Cb));
         memset(Cr, 128, sizeof(Cr));
@@ -514,8 +477,6 @@ static void playdia_decode_video_frame(AK8000 *v) {
         for (int i = 0; i < dc_count; i++) {
             int mb = i / 6, bl = i % 6;
             int mx = mb % PD_MW, my = mb / PD_MW;
-
-            pd_dequant_ac(frame_coeff[i], qscale, v->qtable);
 
             uint8_t block[8][8];
             pd_idct_block(frame_coeff[i], block);
