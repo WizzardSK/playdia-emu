@@ -413,7 +413,7 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
     for (int mb = 0; mb < PD_MW * PD_MH && bs->pos < bs->total_bits; mb++) {
         int mx = mb % PD_MW;
         // Anchor: reset predictor at start of each MB row
-        if (mx == 0)  {
+        if (mx == 0) {
             dc_pred[0] = dc_init_y;
             dc_pred[1] = dc_init_cb;
             dc_pred[2] = dc_init_cr;
