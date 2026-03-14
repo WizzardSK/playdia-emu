@@ -118,7 +118,14 @@ Size  Code bits      Code value   Total bits (code + magnitude)
 16    111111111111110 0x7FFE      31  (extended)
 ```
 
-Magnitude bits use sign-magnitude: if value < 2^(size-1), subtract 2^size - 1.
+### Magnitude Encoding (Under Investigation)
+
+The magnitude bits encoding is not yet fully confirmed. Two candidates:
+
+- **MPEG-1 standard**: if value < 2^(size-1), subtract 2^size - 1. Produces systematic negative bias (mean diff ≈ -1.6/value).
+- **Offset+1** (best candidate): `value = raw_bits - 2^(size-1) + 1`. Reduces DC drift from ~-1420 to ~-78 per frame. For size 2: 00→-1, 01→0, 10→+1, 11→+2.
+
+The offset+1 formula gives near-zero DC sum for some packets (Yumi: -72) but not all (Aqua: -309). See [Research Notes](#dc-encoding-research-2026-03-14) below.
 
 ## Multi-Frame Packing
 
@@ -228,8 +235,66 @@ Rendering with DC coefficients only produces blocky output with correct color re
 See git history for the full set of ~80 test tools in `tools/`.
 
 ## Open Questions
-1. **AC dequantization formula**: The current fixed multiplier (×16) produces within-block detail. Tested alternatives: MPEG-1 `(2×level+1)×QS×qt/32` — too aggressive at high QS (36), produces noise. The qtable (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`, values 10–37) may provide frequency-dependent refinement (qt[k%16]) but is not required for functional decode.
-2. **Chroma AC**: Chroma blocks have AC data in the bitstream but applying it produces rainbow noise. Either chroma AC uses a much smaller dequant multiplier, or chroma is genuinely DC-only and the "chroma AC" bits serve a different structural purpose.
-3. **Qtable purpose**: The 16-entry qtable is constant across all games. It repeats with period 16 across the 64 zigzag positions (qt[k%16]). Not yet used in decoding. May provide frequency-dependent scaling refinement.
-4. **Byte [39] purpose**: Common values 0x00, 0x01, 0x06, 0x07 (150+ distinct values observed). NOT a simple I/P frame type — all packets decode as independent I-frames. May encode packet metadata or scene flags.
-5. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found. The codec may be I-frame only (appropriate for 1994 hardware at 256×144@15fps).
+1. **DC magnitude encoding**: The standard MPEG-1 sign convention produces systematic negative drift. The offset+1 formula (`val = raw - 2^(size-1) + 1`) is closer but still imperfect. See research notes below.
+2. **DC predictor initialization**: Bytes 40-43 of the header vary per packet. The product `byte[40] × QS / 8` is remarkably consistent at 206-234 across all packets (pixel brightness range), suggesting these bytes encode DC predictor initialization or mean frame brightness.
+3. **AC dequantization formula**: The current fixed multiplier (×16) produces within-block detail. Tested alternatives: MPEG-1 `(2×level+1)×QS×qt/32` — too aggressive at high QS (36), produces noise.
+4. **Horizontal DC drift**: Per-row MB predictor reset eliminates vertical drift, but horizontal drift within each macroblock row persists. After linear detrending, recognizable image structure IS visible (different per game/frame), confirming real data is being decoded.
+5. **Qtable purpose**: The 16-entry qtable is constant across all games. Not yet used in decoding.
+6. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found.
+
+---
+
+## DC Encoding Research (2026-03-14)
+
+### Confirmed
+- **VLC table**: Extended MPEG-1 luminance DC VLC (sizes 0-16) — same table used for both DC and AC
+- **Bit order**: MSB-first
+- **Per-component DPCM**: 3 separate predictors (Y, Cb, Cr)
+- **Interleaved DC+AC per block**: Each block has DC value followed by AC coefficients (val=0=EOB), NOT sequential all-DC then all-AC
+- **Per-MB-row predictor reset**: Eliminates vertical drift; predictors reset at the start of each macroblock row
+- **Multiple frames per packet**: 2-3 frames packed back-to-back
+- **Static images**: pkt0==pkt1 in ALL games (boot screen); 6 unique boot screens across 34 games; Yumi game has 41 identical boot frames then animation (11232 total packets)
+
+### Sign Convention Analysis
+
+The standard MPEG-1 sign gives systematic size-dependent negative bias:
+
+| Size | Count | MSB=1 (pos) | MSB=0 (neg) | Neg % |
+|------|-------|-------------|-------------|-------|
+| 1 | 294 | 143 | 151 | 51% |
+| 2 | 245 | 88 | 157 | **64%** |
+| 3 | 103 | 38 | 65 | **63%** |
+| 4 | 75 | 20 | 55 | **73%** |
+
+The bias INCREASES with VLC size — the smoking gun. Raw bit patterns have MSB=0 dominant at sizes 2+, regardless of sign convention.
+
+### Candidate DC Formulas Tested
+
+| Formula | DC sum (DBZ) | DC sum (Yumi) | Notes |
+|---------|-------------|---------------|-------|
+| MPEG-1 standard | -1420 | -72 | Systematic negative drift |
+| Inverted sign | +499 | — | Range=253 but still gradient |
+| **Offset+1** `raw - 2^(N-1) + 1` | **-78** | **+252** | Best balance |
+| Sign=LSB | +82 | -84 | Decent balance |
+| Two's complement | +187 | — | OK but high V error |
+| Offset binary `raw - 2^(N-1)` | -843 | — | Too negative |
+
+### Header Bytes 40-43
+
+| Game | QS | byte40 | b40×8 | b40×QS/8 |
+|------|-----|--------|-------|----------|
+| Aqua Adventure | 13 | 127 | 1016 | **206** |
+| Bandai Collection | 13 | 144 | 1152 | **234** |
+| Sailor Moon | 13 | 144 | 1152 | **234** |
+| Dragon Ball Z | 15 | 124 | 992 | **233** |
+| Ie Naki Ko | 13 | 140 | 1120 | **228** |
+| Yumi Playdia | 15 | 118 | 944 | **221** |
+
+`byte[40] × QS / 8` gives remarkably consistent values 206-234 — plausible mean pixel brightness.
+
+### Models Tested (80+)
+- All VLC permutations (120), all sign conventions (7), all prediction models (DPCM/2D/JPEG-LS/per-row/per-MB)
+- Different grid dimensions, block orderings, init values, scale factors
+- Modular arithmetic, fixed bias correction, 6-predictor model
+- MPEG-1 AC Table B.14/B.15 (reduces errors vs DC VLC for AC, but has ~150 unrecognized codes)
+- Exp-Golomb, fixed-width, chroma DC VLC table
