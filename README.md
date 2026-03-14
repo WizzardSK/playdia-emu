@@ -235,25 +235,45 @@ Rendering with DC coefficients only produces blocky output with correct color re
 See git history for the full set of ~80 test tools in `tools/`.
 
 ## Open Questions
-1. **DC magnitude encoding**: The standard MPEG-1 sign convention produces systematic negative drift. The offset+1 formula (`val = raw - 2^(size-1) + 1`) is closer but still imperfect. See research notes below.
-2. **DC predictor initialization**: Bytes 40-43 of the header vary per packet. The product `byte[40] × QS / 8` is remarkably consistent at 206-234 across all packets (pixel brightness range), suggesting these bytes encode DC predictor initialization or mean frame brightness.
-3. **AC dequantization formula**: The current fixed multiplier (×16) produces within-block detail. Tested alternatives: MPEG-1 `(2×level+1)×QS×qt/32` — too aggressive at high QS (36), produces noise.
-4. **Horizontal DC drift**: Per-row MB predictor reset eliminates vertical drift, but horizontal drift within each macroblock row persists. After linear detrending, recognizable image structure IS visible (different per game/frame), confirming real data is being decoded.
-5. **Qtable purpose**: The 16-entry qtable is constant across all games. Not yet used in decoding.
-6. **P-frames**: All tested frames decode as independent I-frames. No evidence of delta/motion compensation found.
+
+### Critical: DC Reconstruction (UNSOLVED)
+The VLC entropy coding is confirmed correct (0 errors across full packets), but the **DC value reconstruction is fundamentally wrong**. Decoded DC values show **zero correlation** (corr ≈ 0.00) with the known QIS boot screen reference image when compared at block level.
+
+**What works:** VLC decodes 21,232 values per packet with 0 errors. Frame structure (864 DC + ~6,200 AC per frame, 3 frames per packet) is consistent.
+
+**What doesn't work:** No tested combination of sign convention, prediction model, scaling, scan order, or init value produces DC values that correlate with the real QIS boot screen. 100+ models tested.
+
+### Other Open Questions
+1. **16-entry quantization table**: Constant across all games (`0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14`). Only 16 entries is unusual for 8×8 DCT (which needs 64). Could indicate **4×4 DCT** (16 = 4×4) or a repeating pattern (qt[k%16]).
+2. **Resolution**: Most likely **192×144 (4:3)** based on correlation tests, but not confirmed. 4:2:2 chroma (8 blocks/MB = 864) gives exact 4:3 ratio.
+3. **AC dequantization**: Unknown formula. Same VLC as DC, val=0=EOB. ~7.2 AC coefficients per block average.
+4. **I-P-P frame structure**: Frames 2-3 within a packet are NOT identical to frame 1 (confirmed for static boot screens). Likely P-frames (delta).
+5. **Header bytes 40-43**: Vary per packet. `byte[40] × QS / 8 ≈ 206-234` consistently. Purpose unknown.
 
 ---
 
 ## DC Encoding Research (2026-03-14)
 
 ### Confirmed
-- **VLC table**: Extended MPEG-1 luminance DC VLC (sizes 0-16) — same table used for both DC and AC
+- **VLC table**: Extended MPEG-1 luminance DC VLC (sizes 0-16) — decodes ENTIRE packet (21,232 values) with **0 errors**. Same table used for both DC and AC sections.
 - **Bit order**: MSB-first
 - **Per-component DPCM**: 3 separate predictors (Y, Cb, Cr)
-- **Interleaved DC+AC per block**: Each block has DC value followed by AC coefficients (val=0=EOB), NOT sequential all-DC then all-AC
-- **Per-MB-row predictor reset**: Eliminates vertical drift; predictors reset at the start of each macroblock row
-- **Multiple frames per packet**: 2-3 frames packed back-to-back
-- **Static images**: pkt0==pkt1 in ALL games (boot screen); 6 unique boot screens across 34 games; Yumi game has 41 identical boot frames then animation (11232 total packets)
+- **Sequential DC-then-AC**: 864 DC values first, then AC for 864 blocks (val=0=EOB). NOT interleaved per-block.
+- **Frame structure**: ~7,077 VLC values per frame (864 DC + ~6,213 AC), 3 frames per packet = ~21,000 total
+- **I-P-P frames**: Frames 2-3 within a packet differ from frame 1 (delta/P-frames for static content)
+- **Resolution**: Likely 192×144 (4:3) with 4:2:2 chroma (108 MBs × 8 blocks = 864)
+- **Static images**: pkt0==pkt1 in ALL games (boot screen); 6 unique boot screens across 34 games; Yumi game has 41 identical boot frames then animation (11,232 total packets)
+- **VCD-based**: EmularPlaydia blog confirms "VCD format" (MPEG-1 family)
+- **AKM AK8xxx = video chips**: AK8859 is NTSC/PAL video decoder, confirming AK8000 is in AKM's video product line
+
+### Reference Images
+Real hardware screenshots in `reference/` directory:
+- `pd_real_qis.png` — **QIS boot screen** (brown Q, yellow I, blue S on gray marble rectangle, pink/white background)
+- `pd_real_suzu.png` — Ie Naki Ko live-action FMV
+- `pd_real_keroppi.png` — Kero Kero Keroppi animation
+- `pd_real_forest.png` — Forest Sways title screen with readable text
+
+**QIS expected Y profile at 24×18 blocks**: row1=194(bright), rows4-5=131(dark letters), row16=183(bright), row17=111(bottom border). Current decode shows **0 correlation** with this pattern.
 
 ### Sign Convention Analysis
 
@@ -292,44 +312,26 @@ The bias INCREASES with VLC size — the smoking gun. Raw bit patterns have MSB=
 
 `byte[40] × QS / 8` gives remarkably consistent values 206-234 — plausible mean pixel brightness.
 
-### Models Tested (80+)
-- All VLC permutations (120), all sign conventions (7), all prediction models (DPCM/2D/JPEG-LS/per-row/per-MB)
-- Different grid dimensions, block orderings, init values, scale factors
-- Modular arithmetic, fixed bias correction, 6-predictor model
-- MPEG-1 AC Table B.14/B.15 (reduces errors vs DC VLC for AC, but has ~150 unrecognized codes)
-- Exp-Golomb, fixed-width, chroma DC VLC table
+### Models Tested (100+)
+- All VLC code-to-size permutations (120) with multiple sign conventions
+- Sign conventions: MPEG-1 standard, inverted, two's complement, offset binary, offset+1, sign-magnitude, separate sign bit, sign=LSB
+- Scan orders: row-major, column-major (both with and without per-row/column reset)
+- DC scaling: ×1, ×4, ×8, ×QS, ×qtable[0], ×QS×qtable/16
+- Init values: 0, 128, byte[40], byte[40]×8, various combinations
+- Fixed-width: 4-bit, 5-bit, 6-bit two's complement
+- Alternative VLC: Exp-Golomb, Rice k=1, unary sign-magnitude, MPEG-1 chroma DC
+- Alternative codecs: DYUV (CD-i), 4×4 DCT (16-entry qtable match)
+- Prediction: 1D DPCM, 2D (left, above, JPEG-LS), 6-predictor model, subtractive DPCM
+- AC tables: same DC VLC, MPEG-1 Table B.14/B.15 (124 unrecognized codes)
+- MPEG-1 AC Table B.14/B.15 run-level coding
+- Reference matching: correlated decoded DC with downscaled QIS screenshot (max corr ≈ 0.00)
 
-### Breakthrough: Correct VLC Size Assignment (2026-03-14)
+### Observations (not yet explained)
 
-The VLC code-to-size assignment is **NOT** standard MPEG-1. The correct mapping discovered by exhaustive search over all 120 permutations:
+**Column-major vs row-major scan**: Column-major gives V=0.998, row-major gives H=0.991. Both produce high correlation in the scan direction due to DPCM smoothing — this is an artifact of accumulation, not proof of correct scan order.
 
-```
-Code   Bits  Size  (MPEG-1 had)
-00     2     0     (was 1)
-01     2     2     (was 2) ✓
-100    3     1     (was 0)
-101    3     4     (was 3)
-110    3     3     (was 4)
-1110+  4+    5+    (unchanged)
-```
+**VLC permutation 00→0**: Reduces DC sum from -1420 to -109 (for DBZ) but produces very flat images (range ≈ 20 DC units = 2.5 pixels). Standard MPEG-1 assignment produces more contrast but with systematic drift.
 
-Key: the most frequent 2-bit code `00` maps to **size 0** (zero diff), not size 1. This makes sense — in a mostly-white boot screen, most DC blocks are identical to their predecessor.
+**DC × QS scaling**: Produces visible colored output from the emulator — different games/frames show different horizontal color bands. But images are NOT recognizable compared to reference screenshots.
 
-Results with offset+1 value formula:
-- **V correlation: 0.8848** (vs 0.7821 with MPEG-1 assignment)
-- **Row drift: 13.7** (vs 19.7)
-- All 6 unique boot screens produce visually distinct, structured images
-
-### Breakthrough: Column-Major MB Scan Order (2026-03-14)
-
-The macroblock scan order is **column-major** (top-to-bottom within each column, then left-to-right), NOT the standard row-major order.
-
-Evidence: V correlation jumps from 0.90 to **0.998** when switching from row-major to column-major scan.
-
-```
-Scan Order    H corr    V corr
-row-major     0.991     0.897   (drift is vertical)
-col-major     0.938     0.989   (drift is horizontal → per-column reset fixes it)
-```
-
-With per-column predictor reset, the images show clear 2D structure — different boot screens for different games are visually distinct with recognizable shapes (borders, bright/dark regions).
+**The fundamental problem**: No tested DC reconstruction formula produces values that correlate with the known QIS boot screen reference image. The VLC entropy coding is correct, but the mapping from VLC-decoded values to DCT coefficients (or pixel values) remains unknown.
