@@ -319,3 +319,17 @@ Results with offset+1 value formula:
 - **V correlation: 0.8848** (vs 0.7821 with MPEG-1 assignment)
 - **Row drift: 13.7** (vs 19.7)
 - All 6 unique boot screens produce visually distinct, structured images
+
+### Breakthrough: Column-Major MB Scan Order (2026-03-14)
+
+The macroblock scan order is **column-major** (top-to-bottom within each column, then left-to-right), NOT the standard row-major order.
+
+Evidence: V correlation jumps from 0.90 to **0.998** when switching from row-major to column-major scan.
+
+```
+Scan Order    H corr    V corr
+row-major     0.991     0.897   (drift is vertical)
+col-major     0.938     0.989   (drift is horizontal → per-column reset fixes it)
+```
+
+With per-column predictor reset, the images show clear 2D structure — different boot screens for different games are visually distinct with recognizable shapes (borders, bright/dark regions).
