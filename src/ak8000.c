@@ -400,19 +400,30 @@ static void pd_idct_block(const int coeff[64], uint8_t out[8][8]) {
 
 // Decode one video frame from the bitstream
 // Returns number of DC blocks decoded (864 on success), 0 on failure
-static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64]) {
+static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
+                                int dc_init_y, int dc_init_cb, int dc_init_cr,
+                                int qscale) {
     int dc_count = 0;
     memset(coeff, 0, sizeof(int) * PD_NBLOCKS * 64);
 
-    // DC section: per-component DPCM
-    int dc_pred[3] = {0, 0, 0};
+    // DC section: per-component DPCM with row-anchor model
+    // First MB of each row resets predictor to init + first diff (anchor).
+    // Subsequent MBs in the row accumulate diffs normally.
+    int dc_pred[3] = {dc_init_y, dc_init_cb, dc_init_cr};
     for (int mb = 0; mb < PD_MW * PD_MH && bs->pos < bs->total_bits; mb++) {
+        int mx = mb % PD_MW;
+        // Anchor: reset predictor at start of each MB row
+        if (mx == 0)  {
+            dc_pred[0] = dc_init_y;
+            dc_pred[1] = dc_init_cb;
+            dc_pred[2] = dc_init_cr;
+        }
         for (int bl = 0; bl < 6 && bs->pos < bs->total_bits; bl++) {
             int comp = (bl < 4) ? 0 : (bl == 4) ? 1 : 2;
             int diff = pd_read_vlc(bs);
             if (diff == -9999) goto dc_done;
             dc_pred[comp] += diff;
-            coeff[dc_count][0] = dc_pred[comp];
+            coeff[dc_count][0] = dc_pred[comp] * qscale;
             dc_count++;
         }
     }
@@ -420,28 +431,16 @@ dc_done:
     if (dc_count < 6) return 0;
 
     // AC section: direct sequential VLC coding
-    // Each VLC value is a direct AC coefficient placed at the next zigzag position:
     //   0   = end-of-block (EOB)
-    //   !=0 = coefficient value × dequant multiplier
-    //
-    // Evidence: direct interpretation produces exactly 864 EOBs per frame
-    // (one per block), while the rl3 run-level model produced only 775 EOBs
-    // + 76 overflows. Direct model also consumes 100% of bitstream across
-    // 3 frames with 0 bits remaining.
-    //
-    // Chroma blocks have AC data in the bitstream but it's read and
-    // discarded — only luma (Y) AC is applied. Chroma uses DC only.
-    //
-    // Dequantization: value × 16 (fixed multiplier for Y blocks).
-    #define PD_AC_DEQUANT  16
+    //   !=0 = coefficient value placed at next zigzag position
+    // AC applied to all blocks (Y and chroma).
+    #define PD_AC_DEQUANT  2  // AC dequantization scale
     for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
-        int is_chroma = (b % 6 >= 4);
         int k = 1;
         while (k < 64 && bs->pos < bs->total_bits - 2) {
             int val = pd_read_vlc(bs);
             if (val == -9999 || val == 0) break;  // EOB or error
-            if (!is_chroma)
-                coeff[b][k] = val * PD_AC_DEQUANT;
+            coeff[b][k] = val * PD_AC_DEQUANT;
             k++;
         }
     }
@@ -466,6 +465,11 @@ static void playdia_decode_video_frame(AK8000 *v) {
     while (data_end > 40 && f[data_end - 1] == 0xFF) data_end--;
     int total_bits = (data_end - 40) * 8;
 
+    // DC predictor initialization from header bytes 40-43
+    int dc_init_y  = 0;  // No init — let DPCM create contrast
+    int dc_init_cb = 0;
+    int dc_init_cr = 0;
+
     // Decode all frames packed in this bitstream
     pd_bitstream bs = { f + 40, total_bits, 0 };
 
@@ -479,7 +483,9 @@ static void playdia_decode_video_frame(AK8000 *v) {
     int frames_decoded = 0;
 
     while (bs.pos < total_bits - 16) {
-        int dc_count = pd_decode_one_frame(&bs, frame_coeff);
+        int dc_count = pd_decode_one_frame(&bs, frame_coeff,
+                                          dc_init_y, dc_init_cb, dc_init_cr,
+                                          qscale);
         if (dc_count < 6) break;
 
         // IDCT + render to Y/Cb/Cr planes
