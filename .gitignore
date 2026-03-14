@@ -23,6 +23,7 @@ vlc_random
 *.ppm
 *.pgm
 *.png
+!reference/*.png
 frame*.bin
 *.bin
 
