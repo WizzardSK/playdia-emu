@@ -425,7 +425,7 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
             int diff = pd_read_vlc(bs);
             if (diff == -9999) goto dc_done;
             dc_pred[comp] += diff;
-            coeff[dc_count][0] = dc_pred[comp] * qscale;
+            coeff[dc_count][0] = dc_pred[comp] * 8;  // MPEG-1: DC×8 into IDCT
             dc_count++;
         }
     }
@@ -436,7 +436,7 @@ dc_done:
     //   0   = end-of-block (EOB)
     //   !=0 = coefficient value placed at next zigzag position
     // AC applied to all blocks (Y and chroma).
-    #define PD_AC_DEQUANT  2  // AC dequantization scale
+    #define PD_AC_DEQUANT  8  // AC dequantization scale
     for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
         int k = 1;
         while (k < 64 && bs->pos < bs->total_bits - 2) {
@@ -468,7 +468,7 @@ static void playdia_decode_video_frame(AK8000 *v) {
     int total_bits = (data_end - 40) * 8;
 
     // DC predictor initialization from header bytes 40-43
-    int dc_init_y  = 0;  // No init — let DPCM create contrast
+    int dc_init_y  = (int)f[40];   // Y init (pixel = init + 128)
     int dc_init_cb = 0;
     int dc_init_cr = 0;
 
