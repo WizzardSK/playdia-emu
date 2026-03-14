@@ -282,11 +282,12 @@ void ak8000_tick(AK8000 *v) {
 //  IDCT: standard orthonormal 8×8 DCT, pixel = IDCT(coeff) + 128
 // ─────────────────────────────────────────────────────────────
 
-#define PD_W  256
+#define PD_W  192
 #define PD_H  144
-#define PD_MW (PD_W / 16)
-#define PD_MH (PD_H / 16)
-#define PD_NBLOCKS (PD_MW * PD_MH * 6)
+#define PD_MW (PD_W / 16)       // 12
+#define PD_MH (PD_H / 16)       // 9
+#define PD_BPM 8                 // 4:2:2 = 8 blocks per macroblock
+#define PD_NBLOCKS (PD_MW * PD_MH * PD_BPM)  // 12×9×8 = 864
 
 // MPEG-1 luminance DC VLC table extended to sizes 0-16
 static const struct { int len; uint32_t code; } pd_vlc[17] = {
@@ -418,8 +419,9 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
             dc_pred[1] = dc_init_cb;
             dc_pred[2] = dc_init_cr;
         }
-        for (int bl = 0; bl < 6 && bs->pos < bs->total_bits; bl++) {
-            int comp = (bl < 4) ? 0 : (bl == 4) ? 1 : 2;
+        for (int bl = 0; bl < PD_BPM && bs->pos < bs->total_bits; bl++) {
+            // 4:2:2: blocks 0-3=Y, 4-5=Cb, 6-7=Cr
+            int comp = (bl < 4) ? 0 : (bl < 6) ? 1 : 2;
             int diff = pd_read_vlc(bs);
             if (diff == -9999) goto dc_done;
             dc_pred[comp] += diff;
@@ -477,8 +479,8 @@ static void playdia_decode_video_frame(AK8000 *v) {
     static int frame_coeff[PD_NBLOCKS][64];
 
     uint8_t Y[PD_H][PD_W];
-    uint8_t Cb[PD_H / 2][PD_W / 2];
-    uint8_t Cr[PD_H / 2][PD_W / 2];
+    uint8_t Cb[PD_H][PD_W / 2];      // 4:2:2: full height, half width
+    uint8_t Cr[PD_H][PD_W / 2];
 
     int frames_decoded = 0;
 
@@ -494,29 +496,34 @@ static void playdia_decode_video_frame(AK8000 *v) {
         memset(Cr, 128, sizeof(Cr));
 
         for (int i = 0; i < dc_count; i++) {
-            int mb = i / 6, bl = i % 6;
+            int mb = i / PD_BPM, bl = i % PD_BPM;
             int mx = mb % PD_MW, my = mb / PD_MW;
 
             uint8_t block[8][8];
             pd_idct_block(frame_coeff[i], block);
 
             if (bl < 4) {
+                // Y: 4 blocks in 2×2 pattern within 16×16 MB
                 int bx = mx * 16 + (bl & 1) * 8;
                 int by = my * 16 + (bl >> 1) * 8;
                 for (int r = 0; r < 8; r++)
                     for (int c = 0; c < 8; c++)
                         if (by + r < PD_H && bx + c < PD_W)
                             Y[by + r][bx + c] = block[r][c];
-            } else if (bl == 4) {
+            } else if (bl < 6) {
+                // Cb: 4:2:2 = 2 blocks (top/bottom of 16×16 area, 8-wide)
+                int sub = bl - 4; // 0=top, 1=bottom
                 for (int r = 0; r < 8; r++)
                     for (int c = 0; c < 8; c++)
-                        if (my * 8 + r < PD_H / 2 && mx * 8 + c < PD_W / 2)
-                            Cb[my * 8 + r][mx * 8 + c] = block[r][c];
+                        if (my * 16 + sub * 8 + r < PD_H && mx * 8 + c < PD_W / 2)
+                            Cb[my * 16 + sub * 8 + r][mx * 8 + c] = block[r][c];
             } else {
+                // Cr: same as Cb layout
+                int sub = bl - 6; // 0=top, 1=bottom
                 for (int r = 0; r < 8; r++)
                     for (int c = 0; c < 8; c++)
-                        if (my * 8 + r < PD_H / 2 && mx * 8 + c < PD_W / 2)
-                            Cr[my * 8 + r][mx * 8 + c] = block[r][c];
+                        if (my * 16 + sub * 8 + r < PD_H && mx * 8 + c < PD_W / 2)
+                            Cr[my * 16 + sub * 8 + r][mx * 8 + c] = block[r][c];
             }
         }
 
@@ -539,8 +546,8 @@ static void playdia_decode_video_frame(AK8000 *v) {
                 } \
         } while(0)
         PD_DEBLOCK(Y,  PD_H,     PD_W,     8);
-        PD_DEBLOCK(Cb, PD_H / 2, PD_W / 2, 8);
-        PD_DEBLOCK(Cr, PD_H / 2, PD_W / 2, 8);
+        PD_DEBLOCK(Cb, PD_H,     PD_W / 2, 8);  // 4:2:2: full height
+        PD_DEBLOCK(Cr, PD_H,     PD_W / 2, 8);  // 4:2:2
         #undef PD_DEBLOCK
 
         // YCbCr → RGB888 into frame queue (centered in 320×240)
@@ -553,8 +560,8 @@ static void playdia_decode_video_frame(AK8000 *v) {
             for (int y = 0; y < PD_H; y++) {
                 for (int x = 0; x < PD_W; x++) {
                     int yv = Y[y][x];
-                    int cb = Cb[y / 2][x / 2] - 128;
-                    int cr = Cr[y / 2][x / 2] - 128;
+                    int cb = Cb[y][x / 2] - 128;    // 4:2:2: full height
+                    int cr = Cr[y][x / 2] - 128;
                     int dst = ((y + oy) * SCREEN_W + (x + ox)) * 3;
                     dst_buf[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
                     dst_buf[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
