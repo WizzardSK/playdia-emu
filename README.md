@@ -298,3 +298,24 @@ The bias INCREASES with VLC size — the smoking gun. Raw bit patterns have MSB=
 - Modular arithmetic, fixed bias correction, 6-predictor model
 - MPEG-1 AC Table B.14/B.15 (reduces errors vs DC VLC for AC, but has ~150 unrecognized codes)
 - Exp-Golomb, fixed-width, chroma DC VLC table
+
+### Breakthrough: Correct VLC Size Assignment (2026-03-14)
+
+The VLC code-to-size assignment is **NOT** standard MPEG-1. The correct mapping discovered by exhaustive search over all 120 permutations:
+
+```
+Code   Bits  Size  (MPEG-1 had)
+00     2     0     (was 1)
+01     2     2     (was 2) ✓
+100    3     1     (was 0)
+101    3     4     (was 3)
+110    3     3     (was 4)
+1110+  4+    5+    (unchanged)
+```
+
+Key: the most frequent 2-bit code `00` maps to **size 0** (zero diff), not size 1. This makes sense — in a mostly-white boot screen, most DC blocks are identical to their predecessor.
+
+Results with offset+1 value formula:
+- **V correlation: 0.8848** (vs 0.7821 with MPEG-1 assignment)
+- **Row drift: 13.7** (vs 19.7)
+- All 6 unique boot screens produce visually distinct, structured images
