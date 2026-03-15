@@ -37,10 +37,10 @@ Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Ful
 | NEC 78K/0 CPU | Basic instruction set |
 | CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
 | BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
-| Video decode | **DC + AC (direct sequential VLC) + integer IDCT + deblocking** (proprietary AK8000 codec) |
+| Video decode | **AK8000 proprietary DCT codec** — DC offset + fixed 10 AC per block, modified MPEG-1 VLC |
 | Audio decode | **XA ADPCM** with resampling to 44100 Hz |
 | Interactive | **F2 commands** — jumps, choices (F2 44), loops, quiz, timeout |
-| Display | SDL2, 320×240, 256×144 video centered |
+| Display | SDL2, 320×240, 192×144 video centered |
 | Pipeline | 10 sectors/frame @ 30fps (~4× CD speed) |
 
 ### Interactive FMV Commands
@@ -87,45 +87,36 @@ Offset  Content
 The qtable is always `0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14` — likely hardcoded in the AK8000 chip.
 
 ## Image Format
-- **Resolution**: 256×144 pixels
+- **Resolution**: 192×144 pixels (4:3 aspect ratio)
 - **Color**: YCbCr 4:2:0 — 6 blocks per macroblock (4Y + Cb + Cr)
-- **Macroblocks**: 16×9 = 144 macroblocks, 864 blocks total
+- **Macroblocks**: 12×9 = 108 macroblocks, 648 blocks total
 - **Y sub-block order**: TL, TR, BL, BR within each 16×16 macroblock
-- **IDCT**: Standard orthonormal 8×8 DCT, pixel = IDCT(coeff) + 128
+- **IDCT**: Standard orthonormal 8×8 DCT, pixel = IDCT(coeff), NO level shift
 
-## VLC Table (Extended MPEG-1 Luminance DC)
+## VLC Table (Modified MPEG-1 Luminance DC)
 
-Used for **both DC differences and AC levels**. The standard MPEG-1 table (sizes 0–11) is extended to size 16:
+Used for **both DC and AC values**. Based on MPEG-1 luminance DC VLC but with sizes 7/8 **compressed to both 6 bits**:
 
 ```
-Size  Code bits      Code value   Total bits (code + magnitude)
-0     100            0x4          3
-1     00             0x0          3
-2     01             0x1          4
-3     101            0x5          6
-4     110            0x6          7
-5     1110           0xE          9
-6     11110          0x1E         11
-7     111110         0x3E         13
-8     1111110        0x7E         15
-9     11111110       0xFE         17
-10    111111110      0x1FE        19
-11    1111111110     0x3FE        21
-12    11111111110    0x7FE        23  (extended)
-13    111111111110   0xFFE        25  (extended)
-14    1111111111110  0x1FFE       27  (extended)
-15    11111111111110 0x3FFE       29  (extended)
-16    111111111111110 0x7FFE      31  (extended)
+Size  Code bits      Note
+0     100            3 bits — value 0
+1     00             2 bits
+2     01             2 bits
+3     101            3 bits
+4     110            3 bits
+5     1110           4 bits
+6     11110          5 bits
+7     111110         6 bits — standard MPEG-1
+8     111111         6 bits — COMPRESSED (standard would be 1111110 = 7 bits)
 ```
 
-### Magnitude Encoding (Under Investigation)
+**Key difference from standard MPEG-1**: sizes 7 and 8 are both 6-bit codes, differentiated by the last bit (0=size 7, 1=size 8). This saves 1 bit per size-8 occurrence.
 
-The magnitude bits encoding is not yet fully confirmed. Two candidates:
+After reading the size code, `size` additional bits encode the magnitude (MPEG-1 sign convention).
 
-- **MPEG-1 standard**: if value < 2^(size-1), subtract 2^size - 1. Produces systematic negative bias (mean diff ≈ -1.6/value).
-- **Offset+1** (best candidate): `value = raw_bits - 2^(size-1) + 1`. Reduces DC drift from ~-1420 to ~-78 per frame. For size 2: 00→-1, 01→0, 10→+1, 11→+2.
-
-The offset+1 formula gives near-zero DC sum for some packets (Yumi: -72) but not all (Aqua: -309). See [Research Notes](#dc-encoding-research-2026-03-14) below.
+### Magnitude Encoding
+Standard MPEG-1 sign convention: if value < 2^(size-1), subtract 2^size - 1.
+**Note**: AC values show negative bias (mean=-1.73), suggesting sign convention may need inversion.
 
 ## Multi-Frame Packing
 
@@ -140,45 +131,38 @@ Each packet contains **2–4 independent frames** in a continuous bitstream (DC+
 
 Bitstream analysis confirms: each frame's DC section (~3800 bits) + AC section (~29000 bits) consumes ~33% of the packet. The last frame may be slightly truncated when data runs out.
 
-## Bitstream Structure (per frame)
+## Bitstream Structure (per frame) — Current Best Model (2026-03-15)
 
-### Phase 1: DC Coefficients
-864 DC differences decoded sequentially using the extended VLC table.
+### Header Init
+- Bytes 40-42: DC base values for Y, Cb, Cr
+- Byte 43: flags (purpose TBD)
+- Bitstream starts at byte 44
 
-**Per-component DPCM**: Three separate predictors for Y, Cb, Cr (all initialized to 0).
-- Blocks 0–3 of each macroblock: Y predictor
-- Block 4: Cb predictor
-- Block 5: Cr predictor
+### Per-Block Decode (MB-interleaved: 4Y + Cb + Cr per macroblock)
+Each block has **11 VLC values**: 1 DC + 10 AC (fixed count, NO EOB marker).
 
-### Phase 2: AC Coefficients — Direct Sequential VLC
-
-864 blocks of VLC-coded AC coefficients placed sequentially at zigzag positions.
-
-Each VLC value is a **direct coefficient**:
-- Value = 0 → **end of block** (EOB)
-- Value ≠ 0 → coefficient placed at next zigzag position, dequantized by × 16
-
-**Chroma handling**: Cb/Cr blocks have AC data in the bitstream (must be read to maintain sync) but it is discarded — only luma (Y) AC coefficients are applied. Applying chroma AC produces rainbow noise artifacts.
+- **DC**: `pixel_dc = init[component] + vlc_diff` (offset from base, NO DPCM accumulation)
+- **AC**: 10 VLC values placed at zigzag positions 1-10. Value 0 = zero coefficient (NOT EOB).
+- **Dequantization**: Under investigation. Qtable may apply to zigzag positions.
+- **IDCT**: Standard 8×8 orthonormal DCT. DC coeff = dc_value × 8 (IDCT divides by 8).
 
 ### Pseudocode
 ```c
-for each block (0..863):
-    k = 1  // starting zigzag position
-    while k < 64:
-        v = read_vlc()
-        if v == 0: break          // EOB
-        if is_luma_block:
-            coeff[k] = v * 16     // direct value × fixed dequant
-        k++
+for each macroblock (row-major, 12×9):
+    for each block (4Y + Cb + Cr):
+        diff = read_vlc()
+        dc = init[comp] + diff           // offset, no accumulation
+        coeff[0] = dc * 8
+        for i = 1..10:
+            coeff[zigzag[i]] = read_vlc() // × dequant TBD
+        pixel_block = idct_8x8(coeff)     // no level shift
 ```
 
 ### Validation
-
-The direct sequential model is validated by multi-frame decoding:
-- Produces exactly **864 EOBs per frame** (one per block) — the rl3 run-level model produced only 775 EOBs + 76 overflows
-- Consumes exactly 100% of packet bits across 3 frames with 0 bits remaining
-- Produces balanced frame sizes (~33% each for 3-frame packets)
-- Frame boundaries are self-consistent (frame 2 starts exactly where frame 1 ends)
+- Consumes exactly **33.0%** of packet bitstream per frame → 3 frames per packet ✓
+- DC base colors match expected content (blue=space, green=frogs) ✓
+- AC blocks show real DCT basis function patterns ✓
+- No VLC decode errors ✓
 
 ## Dequantization
 

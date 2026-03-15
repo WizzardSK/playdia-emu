@@ -256,29 +256,28 @@ void ak8000_tick(AK8000 *v) {
 // ─────────────────────────────────────────────────────────────
 //  Playdia Proprietary Video Decoder (AK8000 DCT codec)
 //
-//  Frame format (assembled from 6 × F1 sectors, 12282 bytes):
-//    Bytes 0-2:   00 80 04 — frame marker
+//  Packet format (assembled from 6-13 × F1 sectors):
+//    Bytes 0-2:   00 80 04 — packet marker
 //    Byte 3:      quantization scale (QS)
-//    Bytes 4-19:  16-byte quantization table
+//    Bytes 4-19:  16-byte quantization table (4×4, expanded to 8×8)
 //    Bytes 20-35: repeat of qtable
 //    Bytes 36-38: 00 80 24
-//    Byte 39:     frame type (0=I, 1=P, etc.)
-//    Bytes 40+:   bitstream containing 2-4 independent frames
+//    Byte 39:     unknown flags
+//    Bytes 40+:   bitstream containing 1+ frames
 //
-//  Each frame in the bitstream:
-//    1. DC section: 864 DC coefficients via per-component DPCM
-//       using MPEG-1 luminance DC VLC (extended to sizes 0-16)
-//    2. AC section: 864 blocks of packed run-level coded AC coefficients
-//       - Same VLC table as DC; value 0 ("100") = end-of-block
-//       - |v|-1 encodes (run, level): run=(|v|-1)/3, level=((|v|-1)%3)+1
-//       - |v|=1..3 → run=0 (coefficient at current position)
-//       - |v|>3 → skip zero-run positions, then place coefficient
-//       - Position overflow (>=64) = implicit end-of-block
-//       - Chroma AC data exists but is discarded (DC-only for Cb/Cr)
-//    3. Frames packed back-to-back, no alignment needed
-//    4. 2-4 frames per packet depending on content complexity
+//  Each frame: interleaved DC+AC per block, 8×9 macroblocks
+//    For each MB (row-major): 4Y + 1Cb + 1Cr blocks
+//      For each block: 64 VLC-coded coefficients (zigzag order)
+//        coeff[0] = DC (DPCM per component, init=0)
+//        coeff[1..63] = AC
 //
-//  Resolution: 256×144, YCbCr 4:2:0, 16×9 macroblocks = 864 blocks
+//  VLC: Modified MPEG-1 luminance DC VLC
+//    Sizes 0-6: standard MPEG-1
+//    Size 7: 111110 (6 bits) — same as standard
+//    Size 8: 111111 (6 bits) — compressed from standard 7-bit
+//
+//  Dequantization: DC × 8, AC × qtable[pos] × QS / 8
+//  Resolution: 128×144, YCbCr 4:2:0, 8×9 macroblocks = 432 blocks
 //  IDCT: standard orthonormal 8×8 DCT, pixel = IDCT(coeff) + 128
 // ─────────────────────────────────────────────────────────────
 
@@ -286,16 +285,8 @@ void ak8000_tick(AK8000 *v) {
 #define PD_H  144
 #define PD_MW (PD_W / 16)       // 12
 #define PD_MH (PD_H / 16)       // 9
-#define PD_BPM 8                 // 4:2:2 = 8 blocks per macroblock
-#define PD_NBLOCKS (PD_MW * PD_MH * PD_BPM)  // 12×9×8 = 864
-
-// MPEG-1 luminance DC VLC table extended to sizes 0-16
-static const struct { int len; uint32_t code; } pd_vlc[17] = {
-    {3,0x4}, {2,0x0}, {2,0x1}, {3,0x5}, {3,0x6},
-    {4,0xE}, {5,0x1E}, {6,0x3E}, {7,0x7E},
-    {8,0xFE}, {9,0x1FE}, {10,0x3FE},
-    {11,0x7FE}, {12,0xFFE}, {13,0x1FFE}, {14,0x3FFE}, {15,0x7FFE}
-};
+#define PD_BPM 6                 // 4:2:0 = 6 blocks per macroblock
+#define PD_NBLOCKS (PD_MW * PD_MH * PD_BPM)  // 12×9×6 = 648
 
 static const int pd_zigzag[64] = {
     0,  1,  8, 16,  9,  2,  3, 10,
@@ -314,44 +305,43 @@ typedef struct {
     int pos;
 } pd_bitstream;
 
-static int pd_bs_peek(pd_bitstream *bs, int n) {
-    if (n <= 0 || bs->pos + n > bs->total_bits) return -1;
-    int v = 0;
-    for (int i = 0; i < n; i++) {
-        int bp = bs->pos + i;
-        v = (v << 1) | ((bs->data[bp >> 3] >> (7 - (bp & 7))) & 1);
-    }
-    return v;
+static inline int pd_bs_get1(pd_bitstream *bs) {
+    if (bs->pos >= bs->total_bits) return 0;
+    int bp = bs->pos++;
+    return (bs->data[bp >> 3] >> (7 - (bp & 7))) & 1;
 }
 
 static int pd_bs_read(pd_bitstream *bs, int n) {
     if (n <= 0) return 0;
-    if (bs->pos + n > bs->total_bits) return -1;
     int v = 0;
-    for (int i = 0; i < n; i++) {
-        int bp = bs->pos + i;
-        v = (v << 1) | ((bs->data[bp >> 3] >> (7 - (bp & 7))) & 1);
-    }
-    bs->pos += n;
+    for (int i = 0; i < n; i++)
+        v = (v << 1) | pd_bs_get1(bs);
     return v;
 }
 
-// Read a signed value using the extended MPEG-1 DC VLC table
+// AK8000 VLC: MPEG-1 luminance DC VLC with modified sizes 7/8
+// Size 7 = 111110 (6 bits), Size 8 = 111111 (6 bits)
+// Both are 6 bits, differentiated by last bit (0=size7, 1=size8)
 static int pd_read_vlc(pd_bitstream *bs) {
-    for (int i = 0; i < 17; i++) {
-        int bits = pd_bs_peek(bs, pd_vlc[i].len);
-        if (bits < 0) continue;
-        if (bits == (int)pd_vlc[i].code) {
-            bs->pos += pd_vlc[i].len;
-            if (i == 0) return 0;
-            int val = pd_bs_read(bs, i);
-            if (val < 0) return -9999;
-            if (val < (1 << (i - 1)))
-                val -= (1 << i) - 1;
-            return val;
+    if (bs->pos >= bs->total_bits) return -9999;
+    int size;
+    if (pd_bs_get1(bs) == 0) {
+        size = pd_bs_get1(bs) ? 2 : 1;          // 0x → 00=1, 01=2
+    } else {
+        if (pd_bs_get1(bs) == 0) {
+            size = pd_bs_get1(bs) ? 3 : 0;      // 10x → 100=0, 101=3
+        } else {
+            if (pd_bs_get1(bs) == 0) size = 4;       // 110
+            else if (pd_bs_get1(bs) == 0) size = 5;  // 1110
+            else if (pd_bs_get1(bs) == 0) size = 6;  // 11110
+            else size = pd_bs_get1(bs) ? 8 : 7;      // 111110=7, 111111=8
         }
     }
-    return -9999;
+    if (size == 0) return 0;
+    int val = pd_bs_read(bs, size);
+    if (val < (1 << (size - 1)))
+        val -= (1 << size) - 1;
+    return val;
 }
 
 static int pd_clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
@@ -394,60 +384,64 @@ static void pd_idct_block(const int coeff[64], uint8_t out[8][8]) {
             int sum = 0;
             for (int k = 0; k < 8; k++)
                 sum += temp[k][j] * pd_cos[k][i];
-            out[i][j] = (uint8_t)pd_clamp(((sum + 2048) >> 12) + 128);
+            out[i][j] = (uint8_t)pd_clamp((sum + 2048) >> 12);  // no level shift
         }
     }
 }
 
 // Decode one video frame from the bitstream
-// Returns number of DC blocks decoded (864 on success), 0 on failure
+// Interleaved DC+AC per block, 4:2:0: 4Y + 1Cb + 1Cr per macroblock
+// Each block: 1 DC (DPCM) + AC coefficients until VLC value 0 (EOB)
+// Returns number of blocks decoded (432 on success), 0 on failure
 static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
-                                int dc_init_y, int dc_init_cb, int dc_init_cr,
-                                int qscale) {
-    int dc_count = 0;
+                                int qscale, const uint8_t qtable[16],
+                                int init_y, int init_cb, int init_cr) {
+    int nblocks = 0;
     memset(coeff, 0, sizeof(int) * PD_NBLOCKS * 64);
+    // Build 8×8 quant matrix from 4×4 qtable
+    int qm[64];
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            qm[i * 8 + j] = qtable[(i / 2) * 4 + (j / 2)];
 
-    // DC section: per-component DPCM with row-anchor model
-    // First MB of each row resets predictor to init + first diff (anchor).
-    // Subsequent MBs in the row accumulate diffs normally.
-    int dc_pred[3] = {dc_init_y, dc_init_cb, dc_init_cr};
+    int dc_pred[3] = {init_y, init_cb, init_cr};
+
     for (int mb = 0; mb < PD_MW * PD_MH && bs->pos < bs->total_bits; mb++) {
-        int mx = mb % PD_MW;
-        // Anchor: reset predictor at start of each MB row
-        if (mx == 0) {
-            dc_pred[0] = dc_init_y;
-            dc_pred[1] = dc_init_cb;
-            dc_pred[2] = dc_init_cr;
-        }
+        // No per-row reset - continuous DPCM within frame
         for (int bl = 0; bl < PD_BPM && bs->pos < bs->total_bits; bl++) {
-            // 4:2:2: blocks 0-3=Y, 4-5=Cb, 6-7=Cr
-            int comp = (bl < 4) ? 0 : (bl < 6) ? 1 : 2;
+            // 4:2:0: blocks 0-3=Y, 4=Cb, 5=Cr
+            int comp = (bl < 4) ? 0 : (bl < 5) ? 1 : 2;
+
+            // DC coefficient: DPCM
             int diff = pd_read_vlc(bs);
-            if (diff == -9999) goto dc_done;
+            if (diff == -9999) return nblocks;
             dc_pred[comp] += diff;
-            coeff[dc_count][0] = dc_pred[comp] * 8;  // MPEG-1: DC×8 into IDCT
-            dc_count++;
+            coeff[nblocks][0] = dc_pred[comp] * 8;  // ×8 standard
+
+            // AC: sequential VLC, value 0 = EOB (Model B - best bitstream calibration)
+            int k = 1;
+            while (k < 64 && bs->pos < bs->total_bits) {
+                int val = pd_read_vlc(bs);
+                if (val == -9999 || val == 0) break;  // EOB or error
+                // Raw AC (VLC values are already DCT coefficients)
+                coeff[nblocks][pd_zigzag[k]] = val;
+                k++;
+            }
+
+            nblocks++;
+            // Debug: print DC predictor state for first frame
+            if (nblocks <= 6) {
+                printf("[VDC] blk=%d comp=%d diff=%d pred=%d ac=%d\n",
+                       nblocks-1, comp, diff, dc_pred[comp], k-1);
+            }
         }
     }
-dc_done:
-    if (dc_count < 6) return 0;
-
-    // AC section: direct sequential VLC coding
-    //   0   = end-of-block (EOB)
-    //   !=0 = coefficient value placed at next zigzag position
-    // AC applied to all blocks (Y and chroma).
-    #define PD_AC_DEQUANT  8  // AC dequantization scale
-    for (int b = 0; b < dc_count && bs->pos < bs->total_bits - 2; b++) {
-        int k = 1;
-        while (k < 64 && bs->pos < bs->total_bits - 2) {
-            int val = pd_read_vlc(bs);
-            if (val == -9999 || val == 0) break;  // EOB or error
-            coeff[b][k] = val * PD_AC_DEQUANT;
-            k++;
-        }
+    if (nblocks >= PD_NBLOCKS) {
+        printf("[VDC] Frame done: Y_dc=%d Cb_dc=%d Cr_dc=%d (%d blocks)\n",
+               dc_pred[0], dc_pred[1], dc_pred[2], nblocks);
     }
 
-    return dc_count;
+    return nblocks;
 }
 
 static void playdia_decode_video_frame(AK8000 *v) {
@@ -467,35 +461,37 @@ static void playdia_decode_video_frame(AK8000 *v) {
     while (data_end > 40 && f[data_end - 1] == 0xFF) data_end--;
     int total_bits = (data_end - 40) * 8;
 
-    // DC predictor initialization from header bytes 40-43
-    int dc_init_y  = (int)f[40];   // Y init (pixel = init + 128)
-    int dc_init_cb = 0;
-    int dc_init_cr = 0;
-
-    // Decode all frames packed in this bitstream
-    pd_bitstream bs = { f + 40, total_bits, 0 };
+    // Bytes 40-42: DC predictor init values (Y, Cb, Cr)
+    int dc_init_y  = (int)f[40];
+    int dc_init_cb = (int)f[41];
+    int dc_init_cr = (int)f[42];
+    printf("[VID] DC init: Y=%d Cb=%d Cr=%d  byte43=%02X  QS=%d\n",
+           dc_init_y, dc_init_cb, dc_init_cr, f[43], qscale);
+    // Bitstream starts at byte 44
+    int bs_total = (data_end - 44) * 8;
+    pd_bitstream bs = { f + 44, bs_total, 0 };
 
     // Coefficient storage for current frame
     static int frame_coeff[PD_NBLOCKS][64];
 
     uint8_t Y[PD_H][PD_W];
-    uint8_t Cb[PD_H][PD_W / 2];      // 4:2:2: full height, half width
-    uint8_t Cr[PD_H][PD_W / 2];
+    uint8_t Cb[PD_H / 2][PD_W / 2];   // 4:2:0
+    uint8_t Cr[PD_H / 2][PD_W / 2];
 
     int frames_decoded = 0;
 
-    while (bs.pos < total_bits - 16) {
-        int dc_count = pd_decode_one_frame(&bs, frame_coeff,
-                                          dc_init_y, dc_init_cb, dc_init_cr,
-                                          qscale);
-        if (dc_count < 6) break;
+    while (bs.pos < total_bits - 64) {
+        int nblocks = pd_decode_one_frame(&bs, frame_coeff,
+                                          qscale, v->qtable,
+                                          dc_init_y, dc_init_cb, dc_init_cr);
+        if (nblocks < 6) break;
 
         // IDCT + render to Y/Cb/Cr planes
         memset(Y, 128, sizeof(Y));
         memset(Cb, 128, sizeof(Cb));
         memset(Cr, 128, sizeof(Cr));
 
-        for (int i = 0; i < dc_count; i++) {
+        for (int i = 0; i < nblocks; i++) {
             int mb = i / PD_BPM, bl = i % PD_BPM;
             int mx = mb % PD_MW, my = mb / PD_MW;
 
@@ -510,47 +506,33 @@ static void playdia_decode_video_frame(AK8000 *v) {
                     for (int c = 0; c < 8; c++)
                         if (by + r < PD_H && bx + c < PD_W)
                             Y[by + r][bx + c] = block[r][c];
-            } else if (bl < 6) {
-                // Cb: 4:2:2 = 2 blocks (top/bottom of 16×16 area, 8-wide)
-                int sub = bl - 4; // 0=top, 1=bottom
+            } else if (bl == 4) {
+                // Cb: 4:2:0 = 1 block per MB (8×8 → 16×16 area)
                 for (int r = 0; r < 8; r++)
                     for (int c = 0; c < 8; c++)
-                        if (my * 16 + sub * 8 + r < PD_H && mx * 8 + c < PD_W / 2)
-                            Cb[my * 16 + sub * 8 + r][mx * 8 + c] = block[r][c];
+                        if (my * 8 + r < PD_H / 2 && mx * 8 + c < PD_W / 2)
+                            Cb[my * 8 + r][mx * 8 + c] = block[r][c];
             } else {
-                // Cr: same as Cb layout
-                int sub = bl - 6; // 0=top, 1=bottom
+                // Cr: same layout as Cb
                 for (int r = 0; r < 8; r++)
                     for (int c = 0; c < 8; c++)
-                        if (my * 16 + sub * 8 + r < PD_H && mx * 8 + c < PD_W / 2)
-                            Cr[my * 16 + sub * 8 + r][mx * 8 + c] = block[r][c];
+                        if (my * 8 + r < PD_H / 2 && mx * 8 + c < PD_W / 2)
+                            Cr[my * 8 + r][mx * 8 + c] = block[r][c];
             }
         }
 
-        // Deblocking: smooth 8×8 block boundaries in Y/Cb/Cr planes
-        // Strong 3-tap filter: threshold=2, adj=d/3
-        #define PD_DEBLOCK(plane, h, w, step) do { \
-            for (int _by = step; _by < (h); _by += step) \
-                for (int _x = 0; _x < (w); _x++) { \
-                    int _d = (plane)[_by][_x] - (plane)[_by-1][_x]; \
-                    if (_d > 2 || _d < -2) { int _a = _d/3; \
-                        (plane)[_by-1][_x] = (uint8_t)pd_clamp((plane)[_by-1][_x] + _a); \
-                        (plane)[_by][_x]   = (uint8_t)pd_clamp((plane)[_by][_x] - _a); } \
-                } \
-            for (int _y = 0; _y < (h); _y++) \
-                for (int _bx = step; _bx < (w); _bx += step) { \
-                    int _d = (plane)[_y][_bx] - (plane)[_y][_bx-1]; \
-                    if (_d > 2 || _d < -2) { int _a = _d/3; \
-                        (plane)[_y][_bx-1] = (uint8_t)pd_clamp((plane)[_y][_bx-1] + _a); \
-                        (plane)[_y][_bx]   = (uint8_t)pd_clamp((plane)[_y][_bx] - _a); } \
-                } \
-        } while(0)
-        PD_DEBLOCK(Y,  PD_H,     PD_W,     8);
-        PD_DEBLOCK(Cb, PD_H,     PD_W / 2, 8);  // 4:2:2: full height
-        PD_DEBLOCK(Cr, PD_H,     PD_W / 2, 8);  // 4:2:2
-        #undef PD_DEBLOCK
+        // Debug: save Y-only grayscale for first frame
+        if (frames_decoded == 0) {
+            FILE *yf = fopen("/tmp/pd_y_only.pgm", "wb");
+            if (yf) {
+                fprintf(yf, "P5\n%d %d\n255\n", PD_W, PD_H);
+                for (int yy = 0; yy < PD_H; yy++)
+                    fwrite(Y[yy], 1, PD_W, yf);
+                fclose(yf);
+            }
+        }
 
-        // YCbCr → RGB888 into frame queue (centered in 320×240)
+        // YCbCr 4:2:0 → RGB888 into frame queue (centered in 320×240)
         if (v->fq_count < PD_FRAME_QUEUE_SIZE) {
             uint8_t *dst_buf = v->frame_queue[v->fq_write];
             int ox = (SCREEN_W - PD_W) / 2;
@@ -560,8 +542,8 @@ static void playdia_decode_video_frame(AK8000 *v) {
             for (int y = 0; y < PD_H; y++) {
                 for (int x = 0; x < PD_W; x++) {
                     int yv = Y[y][x];
-                    int cb = Cb[y][x / 2] - 128;    // 4:2:2: full height
-                    int cr = Cr[y][x / 2] - 128;
+                    int cb = Cb[y / 2][x / 2] - 128;   // 4:2:0
+                    int cr = Cr[y / 2][x / 2] - 128;
                     int dst = ((y + oy) * SCREEN_W + (x + ox)) * 3;
                     dst_buf[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
                     dst_buf[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
@@ -575,9 +557,6 @@ static void playdia_decode_video_frame(AK8000 *v) {
 
         v->frame_count++;
         frames_decoded++;
-
-        // Byte-align for next frame
-        bs.pos = (bs.pos + 7) & ~7;
     }
 }
 
