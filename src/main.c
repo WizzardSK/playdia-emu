@@ -72,8 +72,8 @@ static void run_headless(Playdia *p, uint32_t max_frames) {
         playdia_run_frame(p);
         // Drain audio even in headless (for stats + to prevent ring overflow)
         pipeline_drain_audio(&p->pipe, &p->video);
-        // Save early frames for debugging
-        if (p->video.frame_count > 0 && p->video.frame_count <= 10) {
+        // Save frames for debugging (every 3rd frame, first 90)
+        if (p->video.frame_count > 0 && p->video.frame_count <= 400 && p->video.frame_count % 20 == 0) {
             char fname[64];
             snprintf(fname, sizeof fname, "/tmp/pd_frame_%03u.ppm", p->video.frame_count);
             FILE *ff = fopen(fname, "wb");

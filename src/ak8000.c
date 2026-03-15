@@ -404,41 +404,27 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
         for (int j = 0; j < 8; j++)
             qm[i * 8 + j] = qtable[(i / 2) * 4 + (j / 2)];
 
-    int dc_pred[3] = {init_y, init_cb, init_cr};
+    int inits[3] = {init_y, init_cb, init_cr};
 
     for (int mb = 0; mb < PD_MW * PD_MH && bs->pos < bs->total_bits; mb++) {
-        // No per-row reset - continuous DPCM within frame
         for (int bl = 0; bl < PD_BPM && bs->pos < bs->total_bits; bl++) {
             // 4:2:0: blocks 0-3=Y, 4=Cb, 5=Cr
             int comp = (bl < 4) ? 0 : (bl < 5) ? 1 : 2;
 
-            // DC coefficient: DPCM
+            // DC: offset from base init (no accumulation)
             int diff = pd_read_vlc(bs);
             if (diff == -9999) return nblocks;
-            dc_pred[comp] += diff;
-            coeff[nblocks][0] = dc_pred[comp] * 8;  // ×8 standard
+            int dc_val = inits[comp] + diff;
+            coeff[nblocks][0] = dc_val * 8;
 
-            // AC: sequential VLC, value 0 = EOB (Model B - best bitstream calibration)
-            int k = 1;
-            while (k < 64 && bs->pos < bs->total_bits) {
+            // AC: fixed 10 coefficients (value 0 = zero coeff, NOT EOB)
+            for (int k = 1; k <= 10 && bs->pos < bs->total_bits; k++) {
                 int val = pd_read_vlc(bs);
-                if (val == -9999 || val == 0) break;  // EOB or error
-                // Raw AC (VLC values are already DCT coefficients)
                 coeff[nblocks][pd_zigzag[k]] = val;
-                k++;
             }
 
             nblocks++;
-            // Debug: print DC predictor state for first frame
-            if (nblocks <= 6) {
-                printf("[VDC] blk=%d comp=%d diff=%d pred=%d ac=%d\n",
-                       nblocks-1, comp, diff, dc_pred[comp], k-1);
-            }
         }
-    }
-    if (nblocks >= PD_NBLOCKS) {
-        printf("[VDC] Frame done: Y_dc=%d Cb_dc=%d Cr_dc=%d (%d blocks)\n",
-               dc_pred[0], dc_pred[1], dc_pred[2], nblocks);
     }
 
     return nblocks;
