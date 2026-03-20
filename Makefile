@@ -26,7 +26,9 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c
+HDRS = $(wildcard src/*.h)
+
+%.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 test: test_full

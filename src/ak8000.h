@@ -39,6 +39,56 @@
 // Internal ES (Elementary Stream) accumulator
 #define ES_BUF_SIZE  (256 * 1024)   // 256KB — enough for several frames
 
+// ── Runtime-tunable codec parameters ─────────────────────────
+typedef struct CodecParams {
+    int  ac_count;       // AC coefficients per block (default 10)
+    int  dc_mode;        // 0=init+diff, 1=DPCM accumulate
+    int  dc_scale;       // DC multiplier (default 8)
+    int  bs_offset;      // bitstream start byte (default 44)
+    int  width;          // frame width (default 192)
+    int  height;         // frame height (default 144)
+    int  level_shift;    // added to pixel after IDCT (default 0)
+    bool use_eob;        // treat VLC 0 as EOB (default false)
+    int  ac_dequant;     // 0=none (raw VLC), 1=qtable*qscale/8
+    int  scan_order;     // 0=row-major, 1=col-major, 2=zigzag, 3=boustrophedon
+                         // 4=interleaved-2, 5=reverse-row, 6=bottom-up
+    int  block_order;    // Y block layout in MB: 0=Z(00,10,01,11), 1=N(00,01,10,11)
+                         // 2=U-pattern, 3=reverse-Z
+    int  dc_only;        // 0=normal, 1=DC only (no AC, shows block-level thumbnail)
+    int  grid_overlay;   // 0=off, 1=8x8 block grid, 2=MB grid, 3=both
+    int  chroma_mode;    // 0=4:2:0 (6 blocks/MB), 1=4:2:2 (8), 2=4:1:1 (6alt), 3=mono(4)
+    int  zigzag_alt;     // 0=standard MPEG-1, 1=alternate (MPEG-2), 2=raster (no zigzag)
+    int  mb_size;        // 0=16x16, 1=8x8 (each "MB" is one block)
+    int  interleave;     // 0=MB-interleaved (4Y+Cb+Cr per MB)
+                         // 1=plane (all Y, then all Cb, then all Cr)
+                         // 2=Y-only (treat all blocks as Y)
+
+    int  selected;       // currently selected param for UI
+
+    // ── Auto-tune state ──────────────────────────────────────
+    bool autotune;       // auto-tune active
+    int  tune_param;     // which param we're currently tuning
+    int  tune_step;      // current step: 0=baseline, 1=try+, 2=try-
+    double best_score;   // best score so far
+    int  tune_wait;      // frames to wait before measuring
+    int  stale_count;    // consecutive params with no improvement
+    bool save_frame;     // flag: save next frame to /tmp
+} CodecParams;
+
+#define CODEC_PARAM_COUNT 17
+
+void    codec_params_init   (CodecParams *cp);
+void    codec_params_adjust (CodecParams *cp, int delta);
+void    codec_params_next   (CodecParams *cp);
+void    codec_params_prev   (CodecParams *cp);
+void    codec_params_print  (const CodecParams *cp);
+
+// Frame quality score (higher = better image structure)
+double  codec_frame_score   (const uint8_t *framebuffer, int fb_w, int fb_h,
+                             int img_w, int img_h);
+// Auto-tune step — call once per frame after decode
+void    codec_autotune_step (CodecParams *cp, double score);
+
 typedef struct AK8000 {
     // ── Registers ─────────────────────────────────────────
     uint8_t  regs[16];
@@ -113,6 +163,9 @@ typedef struct AK8000 {
     uint32_t seek_target;           // LBA to seek to (0 = none pending)
     uint32_t cmd_lba;               // LBA where last F2 command was found
     bool     is_loop;               // true if F2 40 is a backward jump (loop)
+
+    // ── Codec tuning (runtime-adjustable) ─────────────────────
+    CodecParams  codec_params;
 } AK8000;
 
 // ── API ───────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 #include "sdl_frontend.h"
 #include "playdia_sys.h"
+#include "ak8000.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -158,7 +159,67 @@ uint8_t sdl_key_to_btn(SDL_Keycode k) {
 }
 
 // ─────────────────────────────────────────────────────────────
-bool sdl_poll_events(SDLFrontend *fe, uint8_t *controller) {
+//  Codec tuning key handler
+//  Tab/Shift+Tab = select param, +/- = adjust, P = print, R = reset
+// ─────────────────────────────────────────────────────────────
+bool sdl_handle_codec_key(SDL_Keycode k, CodecParams *cp) {
+    if (!cp) return false;
+    switch (k) {
+    case SDLK_TAB: {
+        SDL_Keymod mod = SDL_GetModState();
+        if (mod & KMOD_SHIFT)
+            codec_params_prev(cp);
+        else
+            codec_params_next(cp);
+        return true;
+    }
+    case SDLK_EQUALS:  // + key (=/+)
+    case SDLK_KP_PLUS:
+        codec_params_adjust(cp, 1);
+        return true;
+    case SDLK_MINUS:
+    case SDLK_KP_MINUS:
+        codec_params_adjust(cp, -1);
+        return true;
+    case SDLK_RIGHTBRACKET:
+        codec_params_adjust(cp, 5);
+        return true;
+    case SDLK_LEFTBRACKET:
+        codec_params_adjust(cp, -5);
+        return true;
+    case SDLK_p:
+        codec_params_print(cp);
+        return true;
+    case SDLK_r:
+        codec_params_init(cp);
+        printf("[CODEC] Reset to defaults\n");
+        codec_params_print(cp);
+        return true;
+    case SDLK_s:
+        cp->save_frame = true;
+        printf("[CODEC] Frame save requested\n");
+        return true;
+    case SDLK_t:
+        cp->autotune = !cp->autotune;
+        if (cp->autotune) {
+            cp->tune_param = 0;
+            cp->tune_step = 0;
+            cp->tune_wait = 3;
+            cp->best_score = 0;
+            cp->stale_count = 0;
+            printf("[TUNE] Auto-tune STARTED\n");
+        } else {
+            printf("[TUNE] Auto-tune STOPPED\n");
+        }
+        codec_params_print(cp);
+        return true;
+    default:
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+bool sdl_poll_events_ex(SDLFrontend *fe, uint8_t *controller, CodecParams *cp) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
@@ -172,11 +233,13 @@ bool sdl_poll_events(SDLFrontend *fe, uint8_t *controller) {
                 return false;
             }
             if (e.key.keysym.sym == SDLK_F1) {
-                // Toggle fullscreen
                 SDL_SetWindowFullscreen(fe->window,
                     (SDL_GetWindowFlags(fe->window) & SDL_WINDOW_FULLSCREEN_DESKTOP)
                     ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
             }
+            // Try codec keys first
+            if (sdl_handle_codec_key(e.key.keysym.sym, cp))
+                break;
             *controller |= sdl_key_to_btn(e.key.keysym.sym);
             break;
 
@@ -188,4 +251,8 @@ bool sdl_poll_events(SDLFrontend *fe, uint8_t *controller) {
         }
     }
     return fe->running;
+}
+
+bool sdl_poll_events(SDLFrontend *fe, uint8_t *controller) {
+    return sdl_poll_events_ex(fe, controller, NULL);
 }

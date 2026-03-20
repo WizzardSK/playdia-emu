@@ -36,8 +36,374 @@ static void init_audio_codec(AK8000 *v) {
     printf("[AK8000] MP2 audio decoder ready\n");
 }
 
+// ── Codec parameter tuning ────────────────────────────────────
+static const char *cp_names[CODEC_PARAM_COUNT] = {
+    "ac_count", "dc_mode", "dc_scale", "bs_offset",
+    "width", "height", "level_shift", "use_eob", "ac_dequant",
+    "scan_order", "block_order",
+    "dc_only", "grid", "chroma", "zigzag", "mb_size", "interleave"
+};
+
+void codec_params_init(CodecParams *cp) {
+    cp->ac_count    = 10;
+    cp->dc_mode     = 0;    // init+diff
+    cp->dc_scale    = 8;
+    cp->bs_offset   = 44;
+    cp->width       = 192;
+    cp->height      = 144;
+    cp->level_shift = 0;
+    cp->use_eob     = false;
+    cp->ac_dequant  = 0;
+    cp->scan_order  = 0;    // row-major
+    cp->block_order = 0;    // Z-pattern
+    cp->dc_only     = 0;
+    cp->grid_overlay = 0;
+    cp->chroma_mode = 0;    // 4:2:0
+    cp->zigzag_alt  = 0;    // standard MPEG-1
+    cp->mb_size     = 0;    // 16x16
+    cp->interleave  = 0;    // MB-interleaved
+    cp->selected    = 0;
+}
+
+void codec_params_adjust(CodecParams *cp, int delta) {
+    switch (cp->selected) {
+    case 0: cp->ac_count    += delta; if (cp->ac_count < 0) cp->ac_count = 0; if (cp->ac_count > 63) cp->ac_count = 63; break;
+    case 1: cp->dc_mode     = cp->dc_mode ? 0 : 1; break;
+    case 2: cp->dc_scale    += delta; if (cp->dc_scale < 1) cp->dc_scale = 1; if (cp->dc_scale > 32) cp->dc_scale = 32; break;
+    case 3: cp->bs_offset   += delta; if (cp->bs_offset < 40) cp->bs_offset = 40; if (cp->bs_offset > 52) cp->bs_offset = 52; break;
+    case 4: cp->width       += delta * 16; if (cp->width < 128) cp->width = 128; if (cp->width > 256) cp->width = 256; break;
+    case 5: cp->height      += delta * 16; if (cp->height < 96) cp->height = 96; if (cp->height > 192) cp->height = 192; break;
+    case 6: cp->level_shift += delta * 8; if (cp->level_shift < -64) cp->level_shift = -64; if (cp->level_shift > 64) cp->level_shift = 64; break;
+    case 7: cp->use_eob     = !cp->use_eob; break;
+    case 8: cp->ac_dequant  = cp->ac_dequant ? 0 : 1; break;
+    case 9:  cp->scan_order   += delta; if (cp->scan_order < 0) cp->scan_order = 6; if (cp->scan_order > 6) cp->scan_order = 0; break;
+    case 10: cp->block_order  += delta; if (cp->block_order < 0) cp->block_order = 3; if (cp->block_order > 3) cp->block_order = 0; break;
+    case 11: cp->dc_only      = cp->dc_only ? 0 : 1; break;
+    case 12: cp->grid_overlay += delta; if (cp->grid_overlay < 0) cp->grid_overlay = 3; if (cp->grid_overlay > 3) cp->grid_overlay = 0; break;
+    case 13: cp->chroma_mode  += delta; if (cp->chroma_mode < 0) cp->chroma_mode = 3; if (cp->chroma_mode > 3) cp->chroma_mode = 0; break;
+    case 14: cp->zigzag_alt   += delta; if (cp->zigzag_alt < 0) cp->zigzag_alt = 2; if (cp->zigzag_alt > 2) cp->zigzag_alt = 0; break;
+    case 15: cp->mb_size      = cp->mb_size ? 0 : 1; break;
+    case 16: cp->interleave  += delta; if (cp->interleave < 0) cp->interleave = 2; if (cp->interleave > 2) cp->interleave = 0; break;
+    }
+    codec_params_print(cp);
+}
+
+void codec_params_next(CodecParams *cp) {
+    cp->selected = (cp->selected + 1) % CODEC_PARAM_COUNT;
+    codec_params_print(cp);
+}
+
+void codec_params_prev(CodecParams *cp) {
+    cp->selected = (cp->selected + CODEC_PARAM_COUNT - 1) % CODEC_PARAM_COUNT;
+    codec_params_print(cp);
+}
+
+void codec_params_print(const CodecParams *cp) {
+    printf("\n[CODEC] ");
+    int vals[CODEC_PARAM_COUNT] = {
+        cp->ac_count, cp->dc_mode, cp->dc_scale, cp->bs_offset,
+        cp->width, cp->height, cp->level_shift, cp->use_eob, cp->ac_dequant,
+        cp->scan_order, cp->block_order,
+        cp->dc_only, cp->grid_overlay, cp->chroma_mode, cp->zigzag_alt, cp->mb_size,
+        cp->interleave
+    };
+    for (int i = 0; i < CODEC_PARAM_COUNT; i++) {
+        if (i == cp->selected)
+            printf(">>%s=%d<< ", cp_names[i], vals[i]);
+        else
+            printf("%s=%d ", cp_names[i], vals[i]);
+    }
+    printf("\n");
+}
+
+// ── Frame quality scoring ─────────────────────────────────────
+// Measures image structure quality for a correctly decoded DCT image:
+//
+// 1. Block boundary vs interior ratio (boundary should NOT be much worse)
+// 2. Multi-scale spatial coherence (2×2, 4×4 neighborhood correlation)
+// 3. Histogram spread: a real image uses most of the dynamic range
+// 4. Non-uniform content: penalize flat/repetitive images
+//
+// Score = coherence * spread / boundary_penalty
+// Higher = better (more natural-looking image)
+
+double codec_frame_score(const uint8_t *fb, int fb_w, int fb_h,
+                         int img_w, int img_h) {
+    int ox = (fb_w - img_w) / 2;
+    int oy = (fb_h - img_h) / 2;
+    if (img_w < 32 || img_h < 32) return 0;
+
+    // Build luma array
+    int npx = img_w * img_h;
+    // Use static buffer to avoid large stack alloc
+    static uint8_t luma_buf[320 * 240];
+    for (int y = 0; y < img_h; y++)
+        for (int x = 0; x < img_w; x++) {
+            int idx = ((y + oy) * fb_w + (x + ox)) * 3;
+            luma_buf[y * img_w + x] = (uint8_t)((fb[idx] * 77 + fb[idx+1] * 150 + fb[idx+2] * 29) >> 8);
+        }
+
+    // 1. Histogram: count used bins (out of 32 bins)
+    int hist[32] = {0};
+    long sum = 0;
+    for (int i = 0; i < npx; i++) { hist[luma_buf[i] >> 3]++; sum += luma_buf[i]; }
+    int used_bins = 0;
+    for (int i = 0; i < 32; i++) if (hist[i] > 0) used_bins++;
+    double mean = (double)sum / npx;
+
+    // Penalize images that are mostly one value (flat)
+    int peak_bin = 0;
+    for (int i = 0; i < 32; i++) if (hist[i] > hist[peak_bin]) peak_bin = i;
+    double peak_frac = (double)hist[peak_bin] / npx;
+    if (peak_frac > 0.8) return 0.01; // >80% same value = garbage
+
+    // Histogram spread score: more bins = more realistic
+    double spread = used_bins / 32.0;
+
+    // 2. Block boundary vs interior
+    double boundary_diff = 0, interior_diff = 0;
+    int boundary_n = 0, interior_n = 0;
+
+    for (int y = 0; y < img_h - 1; y++) {
+        for (int x = 0; x < img_w - 1; x++) {
+            int L = luma_buf[y * img_w + x];
+            int R = luma_buf[y * img_w + x + 1];
+            int D = luma_buf[(y+1) * img_w + x];
+            double dh = abs(L - R);
+            double dv = abs(L - D);
+
+            if ((x + 1) % 8 == 0) { boundary_diff += dh; boundary_n++; }
+            else { interior_diff += dh; interior_n++; }
+            if ((y + 1) % 8 == 0) { boundary_diff += dv; boundary_n++; }
+            else { interior_diff += dv; interior_n++; }
+        }
+    }
+
+    double avg_boundary = boundary_n > 0 ? boundary_diff / boundary_n : 999;
+    double avg_interior = interior_n > 0 ? interior_diff / interior_n : 1;
+
+    // Boundary ratio: 1.0=perfect, >1=blocky, <1=boundaries smoother than interior (weird)
+    double bratio = (avg_interior > 0.5) ? avg_boundary / avg_interior : 5.0;
+
+    // 3. 4×4 neighborhood coherence: average correlation in local patches
+    double coh_sum = 0; int coh_n = 0;
+    for (int y = 0; y + 3 < img_h; y += 4) {
+        for (int x = 0; x + 3 < img_w; x += 4) {
+            // Variance within 4×4 patch
+            int psum = 0, psum2 = 0;
+            for (int dy = 0; dy < 4; dy++)
+                for (int dx = 0; dx < 4; dx++) {
+                    int v = luma_buf[(y+dy) * img_w + (x+dx)];
+                    psum += v; psum2 += v * v;
+                }
+            double pmean = psum / 16.0;
+            double pvar = psum2 / 16.0 - pmean * pmean;
+            // Low local variance = coherent patch (good for natural images)
+            coh_sum += 1.0 / (1.0 + pvar / 100.0);
+            coh_n++;
+        }
+    }
+    double coherence = coh_n > 0 ? coh_sum / coh_n : 0;
+
+    // 4. Variance bonus: real images have moderate variance
+    double var = 0;
+    for (int i = 0; i < npx; i++) { double d = luma_buf[i] - mean; var += d * d; }
+    var /= npx;
+    // Sweet spot: variance 200-2000
+    double var_bonus = 1.0;
+    if (var < 50) var_bonus = 0.2;       // too flat
+    else if (var < 200) var_bonus = 0.5 + 0.5 * (var - 50) / 150.0;
+    else if (var > 3000) var_bonus = 0.5; // too noisy
+
+    // Combined score
+    double score = coherence * spread * var_bonus / (bratio * bratio);
+    return score;
+}
+
+// ── Auto-tune hill climbing ──────────────────────────────────
+// Each step: measure baseline, try +delta, try -delta for current param
+// Keep whichever is best, move to next param
+static int at_get_val(const CodecParams *cp, int param) {
+    switch (param) {
+    case 0: return cp->ac_count;
+    case 1: return cp->dc_mode;
+    case 2: return cp->dc_scale;
+    case 3: return cp->bs_offset;
+    case 4: return cp->width;
+    case 5: return cp->height;
+    case 6: return cp->level_shift;
+    case 7: return cp->use_eob ? 1 : 0;
+    case 8: return cp->ac_dequant;
+    case 9: return cp->scan_order;
+    case 10: return cp->block_order;
+    case 11: return cp->dc_only;
+    case 12: return cp->grid_overlay;
+    case 13: return cp->chroma_mode;
+    case 14: return cp->zigzag_alt;
+    case 15: return cp->mb_size;
+    case 16: return cp->interleave;
+    default: return 0;
+    }
+}
+
+static int at_clamp(int val, int lo, int hi) { return val < lo ? lo : val > hi ? hi : val; }
+
+static void at_set_val(CodecParams *cp, int param, int val) {
+    switch (param) {
+    case 0: cp->ac_count    = at_clamp(val, 0, 63); break;
+    case 1: cp->dc_mode     = at_clamp(val, 0, 1); break;
+    case 2: cp->dc_scale    = at_clamp(val, 1, 32); break;
+    case 3: cp->bs_offset   = at_clamp(val, 40, 52); break;
+    case 4: cp->width       = at_clamp(val, 128, 256); break;
+    case 5: cp->height      = at_clamp(val, 96, 192); break;
+    case 6: cp->level_shift = at_clamp(val, -64, 64); break;
+    case 7: cp->use_eob     = at_clamp(val, 0, 1); break;
+    case 8: cp->ac_dequant  = at_clamp(val, 0, 5); break;
+    case 9: cp->scan_order  = at_clamp(val, 0, 6); break;
+    case 10: cp->block_order = at_clamp(val, 0, 3); break;
+    case 11: cp->dc_only    = at_clamp(val, 0, 1); break;
+    case 12: cp->grid_overlay = at_clamp(val, 0, 3); break;
+    case 13: cp->chroma_mode = at_clamp(val, 0, 3); break;
+    case 14: cp->zigzag_alt = at_clamp(val, 0, 2); break;
+    case 15: cp->mb_size    = at_clamp(val, 0, 1); break;
+    case 16: cp->interleave = at_clamp(val, 0, 2); break;
+    }
+}
+
+// Step sizes per param
+static int at_delta(int param) {
+    switch (param) {
+    case 0: return 1;     // ac_count: ±1
+    case 1: return 1;     // dc_mode: toggle
+    case 2: return 1;     // dc_scale: ±1
+    case 3: return 1;     // bs_offset: ±1
+    case 4: return 16;    // width: ±16
+    case 5: return 16;    // height: ±16
+    case 6: return 8;     // level_shift: ±8
+    case 7: return 1;     // use_eob: toggle
+    case 8: return 1;     // ac_dequant: toggle
+    case 9: return 1;     // scan_order: cycle
+    case 10: return 1;    // block_order: cycle
+    case 11: return 1;    // dc_only: toggle
+    case 12: return 1;    // grid: cycle
+    case 13: return 1;    // chroma: cycle
+    case 14: return 1;    // zigzag: cycle
+    case 15: return 1;    // mb_size: toggle
+    case 16: return 1;    // interleave: cycle
+    default: return 1;
+    }
+}
+
+static int at_saved_val;
+static double at_scores[3]; // baseline, try+, try-
+
+void codec_autotune_step(CodecParams *cp, double score) {
+    if (!cp->autotune) return;
+
+    // Wait frames for decoder to settle after param change
+    if (cp->tune_wait > 0) { cp->tune_wait--; return; }
+
+    switch (cp->tune_step) {
+    case 0: // Measure baseline
+        at_scores[0] = score;
+        at_saved_val = at_get_val(cp, cp->tune_param);
+        // Try +delta
+        if (cp->tune_param == 1 || cp->tune_param == 7 || cp->tune_param == 8) {
+            // Boolean params: just toggle
+            at_set_val(cp, cp->tune_param, at_saved_val ? 0 : 1);
+            cp->tune_step = 1;
+        } else {
+            at_set_val(cp, cp->tune_param, at_saved_val + at_delta(cp->tune_param));
+        }
+        cp->tune_step = 1;
+        cp->tune_wait = 5;
+        printf("[TUNE] %s: baseline=%.2f, trying +%d (val=%d→%d)\n",
+               cp_names[cp->tune_param], score,
+               at_delta(cp->tune_param), at_saved_val,
+               at_get_val(cp, cp->tune_param));
+        break;
+
+    case 1: // Measure +delta
+        at_scores[1] = score;
+        // For boolean params, skip try- (it's the same as baseline)
+        if (cp->tune_param == 1 || cp->tune_param == 7 || cp->tune_param == 8) {
+            cp->tune_step = 3; // go to decision
+            // fall through to decision
+        } else {
+            // Try -delta
+            at_set_val(cp, cp->tune_param, at_saved_val - at_delta(cp->tune_param));
+            cp->tune_step = 2;
+            cp->tune_wait = 5;
+            printf("[TUNE] %s: +delta=%.2f, trying -%d (val=%d)\n",
+                   cp_names[cp->tune_param], score,
+                   at_delta(cp->tune_param),
+                   at_get_val(cp, cp->tune_param));
+            break;
+        }
+        // fallthrough for booleans
+        __attribute__((fallthrough));
+
+    case 2: // Measure -delta
+        at_scores[2] = score;
+        cp->tune_step = 3;
+        // fallthrough to decision
+        __attribute__((fallthrough));
+
+    case 3: { // Decision
+        int best = 0;
+        double best_s = at_scores[0];
+        int n_tries = (cp->tune_param == 1 || cp->tune_param == 7 || cp->tune_param == 8) ? 2 : 3;
+        for (int i = 1; i < n_tries; i++) {
+            if (at_scores[i] > best_s) { best_s = at_scores[i]; best = i; }
+        }
+
+        if (best == 0) {
+            // Baseline was best — revert
+            at_set_val(cp, cp->tune_param, at_saved_val);
+            printf("[TUNE] %s: KEEP %d (scores: base=%.2f +d=%.2f -d=%.2f)\n",
+                   cp_names[cp->tune_param], at_saved_val,
+                   at_scores[0], at_scores[1],
+                   n_tries > 2 ? at_scores[2] : -1.0);
+            cp->stale_count++;
+        } else if (best == 1) {
+            at_set_val(cp, cp->tune_param, at_saved_val + at_delta(cp->tune_param));
+            printf("[TUNE] %s: BETTER at %d (+delta, score %.2f→%.2f)\n",
+                   cp_names[cp->tune_param],
+                   at_get_val(cp, cp->tune_param),
+                   at_scores[0], at_scores[1]);
+            cp->stale_count = 0;
+        } else {
+            at_set_val(cp, cp->tune_param, at_saved_val - at_delta(cp->tune_param));
+            printf("[TUNE] %s: BETTER at %d (-delta, score %.2f→%.2f)\n",
+                   cp_names[cp->tune_param],
+                   at_get_val(cp, cp->tune_param),
+                   at_scores[0], at_scores[2]);
+            cp->stale_count = 0;
+        }
+
+        // Move to next param
+        cp->tune_param = (cp->tune_param + 1) % CODEC_PARAM_COUNT;
+        cp->tune_step = 0;
+        cp->tune_wait = 3;
+
+        // Print current state every full cycle
+        if (cp->tune_param == 0) {
+            printf("[TUNE] === Cycle complete ===\n");
+            codec_params_print(cp);
+            // If all params stale for 2 full cycles, stop
+            if (cp->stale_count >= CODEC_PARAM_COUNT * 2) {
+                printf("[TUNE] Converged! Stopping auto-tune.\n");
+                cp->autotune = false;
+            }
+        }
+        break;
+    }
+    }
+}
+
 void ak8000_init(AK8000 *v) {
     memset(v, 0, sizeof *v);
+    codec_params_init(&v->codec_params);
     ak8000_reset(v);
     init_video_codec(v);
     init_audio_codec(v);
@@ -288,7 +654,8 @@ void ak8000_tick(AK8000 *v) {
 #define PD_BPM 6                 // 4:2:0 = 6 blocks per macroblock
 #define PD_NBLOCKS (PD_MW * PD_MH * PD_BPM)  // 12×9×6 = 648
 
-static const int pd_zigzag[64] = {
+// Zigzag scan orders
+static const int pd_zigzag_standard[64] = {
     0,  1,  8, 16,  9,  2,  3, 10,
    17, 24, 32, 25, 18, 11,  4,  5,
    12, 19, 26, 33, 40, 48, 41, 34,
@@ -298,6 +665,31 @@ static const int pd_zigzag[64] = {
    58, 59, 52, 45, 38, 31, 39, 46,
    53, 60, 61, 54, 47, 55, 62, 63
 };
+// MPEG-2 alternate scan (field/interlaced DCT)
+static const int pd_zigzag_alt[64] = {
+    0,  8, 16, 24,  1,  9,  2, 10,
+   17, 25, 32, 40, 48, 56, 57, 49,
+   41, 33, 26, 18,  3, 11,  4, 12,
+   19, 27, 34, 42, 50, 58, 35, 43,
+   51, 59, 20, 28,  5, 13,  6, 14,
+   21, 29, 36, 44, 52, 60, 37, 45,
+   53, 61, 22, 30,  7, 15, 23, 31,
+   38, 46, 54, 62, 39, 47, 55, 63
+};
+// Raster scan (no zigzag — row by row)
+static const int pd_zigzag_raster[64] = {
+    0,  1,  2,  3,  4,  5,  6,  7,
+    8,  9, 10, 11, 12, 13, 14, 15,
+   16, 17, 18, 19, 20, 21, 22, 23,
+   24, 25, 26, 27, 28, 29, 30, 31,
+   32, 33, 34, 35, 36, 37, 38, 39,
+   40, 41, 42, 43, 44, 45, 46, 47,
+   48, 49, 50, 51, 52, 53, 54, 55,
+   56, 57, 58, 59, 60, 61, 62, 63
+};
+
+// Active zigzag pointer (set per-frame based on codec params)
+static const int *pd_zigzag = pd_zigzag_standard;
 
 typedef struct {
     const uint8_t *data;
@@ -395,9 +787,30 @@ static void pd_idct_block(const int coeff[64], uint8_t out[8][8]) {
 // Returns number of blocks decoded (432 on success), 0 on failure
 static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
                                 int qscale, const uint8_t qtable[16],
-                                int init_y, int init_cb, int init_cr) {
+                                int init_y, int init_cb, int init_cr,
+                                const CodecParams *cp) {
     int nblocks = 0;
+    int mbpx = cp->mb_size ? 8 : 16;  // MB pixel size
+    int mw = cp->width / mbpx;
+    int mh = cp->height / mbpx;
+    // Blocks per MB depends on chroma mode and MB size
+    int bpm;
+    if (cp->mb_size) {
+        bpm = 1;  // 8x8 MB = just 1 block (Y only or mono)
+    } else {
+        switch (cp->chroma_mode) {
+        case 0: bpm = 6; break;  // 4:2:0 = 4Y + Cb + Cr
+        case 1: bpm = 8; break;  // 4:2:2 = 4Y + 2Cb + 2Cr
+        case 2: bpm = 6; break;  // 4:1:1 = 4Y + Cb + Cr (different subsampling)
+        case 3: bpm = 4; break;  // mono = 4Y only
+        default: bpm = 6; break;
+        }
+    }
+    int max_blocks = mw * mh * bpm;
+    if (max_blocks > PD_NBLOCKS) max_blocks = PD_NBLOCKS;
+
     memset(coeff, 0, sizeof(int) * PD_NBLOCKS * 64);
+
     // Build 8×8 quant matrix from 4×4 qtable
     int qm[64];
     for (int i = 0; i < 8; i++)
@@ -405,22 +818,90 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
             qm[i * 8 + j] = qtable[(i / 2) * 4 + (j / 2)];
 
     int inits[3] = {init_y, init_cb, init_cr};
+    int dc_pred[3] = {init_y, init_cb, init_cr};
 
-    for (int mb = 0; mb < PD_MW * PD_MH && bs->pos < bs->total_bits; mb++) {
-        for (int bl = 0; bl < PD_BPM && bs->pos < bs->total_bits; bl++) {
-            // 4:2:0: blocks 0-3=Y, 4=Cb, 5=Cr
-            int comp = (bl < 4) ? 0 : (bl < 5) ? 1 : 2;
+    // Plane-interleaved: all Y blocks first, then Cb, then Cr
+    // Total blocks: Y=mw*mh*4, Cb=mw*mh, Cr=mw*mh (for 4:2:0)
+    int total_y  = mw * mh * 4;
+    int total_cb = mw * mh;
 
-            // DC: offset from base init (no accumulation)
+    for (int mb = 0; mb < mw * mh && bs->pos < bs->total_bits; mb++) {
+        for (int bl = 0; bl < bpm && bs->pos < bs->total_bits; bl++) {
+            if (nblocks >= max_blocks) return nblocks;
+
+            int comp;
+            if (cp->interleave == 1) {
+                // Plane mode: first total_y=Y, then total_cb=Cb, then Cr
+                if (nblocks < total_y) comp = 0;
+                else if (nblocks < total_y + total_cb) comp = 1;
+                else comp = 2;
+            } else if (cp->interleave == 2) {
+                comp = 0; // Y-only
+            } else {
+                // MB-interleaved: blocks 0-3=Y, 4=Cb, 5=Cr
+                comp = (bl < 4) ? 0 : (bl < 5) ? 1 : 2;
+            }
+
+            // DC
             int diff = pd_read_vlc(bs);
             if (diff == -9999) return nblocks;
-            int dc_val = inits[comp] + diff;
-            coeff[nblocks][0] = dc_val * 8;
+            int dc_val;
+            if (cp->dc_mode == 0) {
+                // Mode 0: init+diff (no accumulation)
+                dc_val = inits[comp] + diff;
+            } else {
+                // Mode 1: DPCM accumulate
+                dc_val = dc_pred[comp] + diff;
+                dc_pred[comp] = dc_val;
+            }
+            coeff[nblocks][0] = dc_val * cp->dc_scale;
 
-            // AC: fixed 10 coefficients (value 0 = zero coeff, NOT EOB)
-            for (int k = 1; k <= 10 && bs->pos < bs->total_bits; k++) {
-                int val = pd_read_vlc(bs);
-                coeff[nblocks][pd_zigzag[k]] = val;
+            // AC coefficients (skip if dc_only mode)
+            if (cp->dc_only) {
+                // DC-only: skip AC, just read them to advance bitstream
+                // but don't store them
+                if (cp->use_eob) {
+                    for (int k = 1; k < 64 && bs->pos < bs->total_bits; k++) {
+                        int val = pd_read_vlc(bs);
+                        if (val == 0) break;
+                    }
+                } else {
+                    for (int k = 1; k <= cp->ac_count && k < 64 && bs->pos < bs->total_bits; k++)
+                        pd_read_vlc(bs);
+                }
+            } else if (cp->use_eob) {
+                // EOB mode: VLC 0 = end of block
+                for (int k = 1; k < 64 && bs->pos < bs->total_bits; k++) {
+                    int val = pd_read_vlc(bs);
+                    if (val == 0) break;
+                    if (cp->ac_dequant == 1)
+                        val = val * qm[pd_zigzag[k]] * qscale / 8;
+                    else if (cp->ac_dequant == 2)
+                        val = val * qm[pd_zigzag[k]] * qscale / 16;
+                    else if (cp->ac_dequant == 3)
+                        val = val * qscale;
+                    else if (cp->ac_dequant == 4)
+                        val = val * qm[pd_zigzag[k]];
+                    else if (cp->ac_dequant == 5)
+                        val = val * qm[pd_zigzag[k]] / 2;
+                    coeff[nblocks][pd_zigzag[k]] = val;
+                }
+            } else {
+                // Fixed count mode
+                for (int k = 1; k <= cp->ac_count && k < 64 && bs->pos < bs->total_bits; k++) {
+                    int val = pd_read_vlc(bs);
+                    if (cp->ac_dequant == 1)
+                        val = val * qm[pd_zigzag[k]] * qscale / 8;
+                    else if (cp->ac_dequant == 2)
+                        val = val * qm[pd_zigzag[k]] * qscale / 16;
+                    else if (cp->ac_dequant == 3)
+                        val = val * qscale;
+                    else if (cp->ac_dequant == 4)
+                        val = val * qm[pd_zigzag[k]];
+                    else if (cp->ac_dequant == 5)
+                        val = val * qm[pd_zigzag[k]] / 2;
+                    coeff[nblocks][pd_zigzag[k]] = val;
+                }
             }
 
             nblocks++;
@@ -434,6 +915,14 @@ static void playdia_decode_video_frame(AK8000 *v) {
     if (v->vid_frame_pos < 40) return;
 
     const uint8_t *f = v->vid_frame_buf;
+    const CodecParams *cp = &v->codec_params;
+
+    // Select zigzag table
+    switch (cp->zigzag_alt) {
+    case 1:  pd_zigzag = pd_zigzag_alt; break;
+    case 2:  pd_zigzag = pd_zigzag_raster; break;
+    default: pd_zigzag = pd_zigzag_standard; break;
+    }
 
     // Validate header
     if (f[0] != 0x00 || f[1] != 0x80 || f[2] != 0x04) return;
@@ -441,6 +930,17 @@ static void playdia_decode_video_frame(AK8000 *v) {
     uint8_t qscale = f[3];
     memcpy(v->qtable, f + 4, 16);
     v->qscale = qscale;
+
+    // Dump qtable once
+    static bool qtable_dumped = false;
+    if (!qtable_dumped) {
+        printf("[VID] QTable 4x4:");
+        for (int i = 0; i < 16; i++) printf(" %d", v->qtable[i]);
+        printf("\n[VID] Bytes 20-39:");
+        for (int i = 20; i < 40; i++) printf(" %02X", f[i]);
+        printf("\n");
+        qtable_dumped = true;
+    }
 
     // Find actual data end (strip 0xFF padding)
     int data_end = v->vid_frame_pos;
@@ -453,88 +953,268 @@ static void playdia_decode_video_frame(AK8000 *v) {
     int dc_init_cr = (int)f[42];
     printf("[VID] DC init: Y=%d Cb=%d Cr=%d  byte43=%02X  QS=%d\n",
            dc_init_y, dc_init_cb, dc_init_cr, f[43], qscale);
-    // Bitstream starts at byte 44
-    int bs_total = (data_end - 44) * 8;
-    pd_bitstream bs = { f + 44, bs_total, 0 };
+
+    // Bitstream starts at configurable offset
+    int bso = cp->bs_offset;
+    if (bso >= data_end) return;
+    int bs_total = (data_end - bso) * 8;
+    pd_bitstream bs = { f + bso, bs_total, 0 };
+
+    // Use tunable dimensions
+    int pw = cp->width;
+    int ph = cp->height;
+    int pmw = pw / 16;
+    int pmh = ph / 16;
+    if (pmw < 1) pmw = 1;
+    if (pmh < 1) pmh = 1;
 
     // Coefficient storage for current frame
     static int frame_coeff[PD_NBLOCKS][64];
 
-    uint8_t Y[PD_H][PD_W];
-    uint8_t Cb[PD_H / 2][PD_W / 2];   // 4:2:0
-    uint8_t Cr[PD_H / 2][PD_W / 2];
+    // Dynamic plane buffers (stack-allocated, max 320x240)
+    uint8_t Y[240][320];
+    uint8_t Cb[120][160];
+    uint8_t Cr[120][160];
 
     int frames_decoded = 0;
 
     while (bs.pos < total_bits - 64) {
         int nblocks = pd_decode_one_frame(&bs, frame_coeff,
                                           qscale, v->qtable,
-                                          dc_init_y, dc_init_cb, dc_init_cr);
+                                          dc_init_y, dc_init_cb, dc_init_cr,
+                                          cp);
         if (nblocks < 6) break;
 
         // IDCT + render to Y/Cb/Cr planes
-        memset(Y, 128, sizeof(Y));
+        memset(Y, 128 + cp->level_shift, sizeof(Y));
         memset(Cb, 128, sizeof(Cb));
         memset(Cr, 128, sizeof(Cr));
 
-        for (int i = 0; i < nblocks; i++) {
-            int mb = i / PD_BPM, bl = i % PD_BPM;
-            int mx = mb % PD_MW, my = mb / PD_MW;
+        // Build macroblock scan order lookup table
+        int nmb = pmw * pmh;
+        int mb_scan_x[256], mb_scan_y[256]; // max 16x16 MBs
+        for (int m = 0; m < nmb && m < 256; m++) {
+            int sx, sy;
+            switch (cp->scan_order) {
+            default:
+            case 0: // row-major (standard)
+                sx = m % pmw; sy = m / pmw; break;
+            case 1: // column-major
+                sx = m / pmh; sy = m % pmh; break;
+            case 2: { // zigzag (alternating row direction)
+                sy = m / pmw; sx = m % pmw;
+                if (sy & 1) sx = pmw - 1 - sx; // reverse odd rows
+                break;
+            }
+            case 3: { // boustrophedon (snake)
+                sy = m / pmw; sx = m % pmw;
+                if (sy & 1) sx = pmw - 1 - sx;
+                break;
+            }
+            case 4: { // interleaved: even MBs first, then odd
+                int half = nmb / 2;
+                if (m < half) { int mm = m * 2; sx = mm % pmw; sy = mm / pmw; }
+                else { int mm = (m - half) * 2 + 1; sx = mm % pmw; sy = mm / pmw; }
+                break;
+            }
+            case 5: // reverse row-major
+                sx = (nmb - 1 - m) % pmw; sy = (nmb - 1 - m) / pmw; break;
+            case 6: { // row-major but starting from bottom
+                int rm = (pmh - 1 - m / pmw) * pmw + m % pmw;
+                sx = rm % pmw; sy = rm / pmw; break;
+            }
+            }
+            mb_scan_x[m] = sx;
+            mb_scan_y[m] = sy;
+        }
 
+        // Y block order within macroblock (4 blocks)
+        // Each entry: (dx, dy) offset in 8-pixel units within 16x16 MB
+        static const int blk_orders[4][4][2] = {
+            {{0,0},{1,0},{0,1},{1,1}},  // 0: Z-pattern (standard MPEG)
+            {{0,0},{0,1},{1,0},{1,1}},  // 1: N-pattern (column-first)
+            {{0,0},{1,0},{1,1},{0,1}},  // 2: U-pattern
+            {{0,0},{0,1},{1,1},{1,0}},  // 3: reverse-Z
+        };
+        int bord = cp->block_order;
+        if (bord < 0 || bord > 3) bord = 0;
+
+        int mbpx = cp->mb_size ? 8 : 16;
+        int bpm;
+        if (cp->mb_size) { bpm = 1; }
+        else {
+            switch (cp->chroma_mode) {
+            case 0: bpm = 6; break; case 1: bpm = 8; break;
+            case 2: bpm = 6; break; case 3: bpm = 4; break;
+            default: bpm = 6; break;
+            }
+        }
+
+        // Plane-interleaved block counts
+        int plane_total_y  = pmw * pmh * 4;
+        int plane_total_cb = pmw * pmh;
+        int yw = pw / 8, yh = ph / 8;  // Y blocks grid for plane mode
+        int cw = pw / 16, ch = ph / 16; // chroma blocks grid
+
+        for (int i = 0; i < nblocks; i++) {
             uint8_t block[8][8];
             pd_idct_block(frame_coeff[i], block);
 
-            if (bl < 4) {
-                // Y: 4 blocks in 2×2 pattern within 16×16 MB
-                int bx = mx * 16 + (bl & 1) * 8;
-                int by = my * 16 + (bl >> 1) * 8;
+            if (cp->level_shift != 0) {
                 for (int r = 0; r < 8; r++)
                     for (int c = 0; c < 8; c++)
-                        if (by + r < PD_H && bx + c < PD_W)
+                        block[r][c] = (uint8_t)pd_clamp((int)block[r][c] + cp->level_shift);
+            }
+
+            if (cp->interleave == 1) {
+                // Plane mode: blocks 0..total_y-1 = Y raster, then Cb, then Cr
+                if (i < plane_total_y) {
+                    int bi = i;
+                    int bx = (bi % yw) * 8;
+                    int by = (bi / yw) * 8;
+                    for (int r = 0; r < 8; r++)
+                        for (int c = 0; c < 8; c++)
+                            if (by + r < ph && bx + c < pw)
+                                Y[by + r][bx + c] = block[r][c];
+                } else if (i < plane_total_y + plane_total_cb) {
+                    int bi = i - plane_total_y;
+                    int bx = (bi % cw) * 8;
+                    int by = (bi / cw) * 8;
+                    for (int r = 0; r < 8; r++)
+                        for (int c = 0; c < 8; c++)
+                            if (by + r < ph / 2 && bx + c < pw / 2)
+                                Cb[by + r][bx + c] = block[r][c];
+                } else {
+                    int bi = i - plane_total_y - plane_total_cb;
+                    int bx = (bi % cw) * 8;
+                    int by = (bi / cw) * 8;
+                    for (int r = 0; r < 8; r++)
+                        for (int c = 0; c < 8; c++)
+                            if (by + r < ph / 2 && bx + c < pw / 2)
+                                Cr[by + r][bx + c] = block[r][c];
+                }
+            } else if (cp->interleave == 2) {
+                // Y-only raster: all blocks are Y
+                int bx = (i % yw) * 8;
+                int by = (i / yw) * 8;
+                for (int r = 0; r < 8; r++)
+                    for (int c = 0; c < 8; c++)
+                        if (by + r < ph && bx + c < pw)
                             Y[by + r][bx + c] = block[r][c];
-            } else if (bl == 4) {
-                // Cb: 4:2:0 = 1 block per MB (8×8 → 16×16 area)
-                for (int r = 0; r < 8; r++)
-                    for (int c = 0; c < 8; c++)
-                        if (my * 8 + r < PD_H / 2 && mx * 8 + c < PD_W / 2)
-                            Cb[my * 8 + r][mx * 8 + c] = block[r][c];
             } else {
-                // Cr: same layout as Cb
-                for (int r = 0; r < 8; r++)
-                    for (int c = 0; c < 8; c++)
-                        if (my * 8 + r < PD_H / 2 && mx * 8 + c < PD_W / 2)
-                            Cr[my * 8 + r][mx * 8 + c] = block[r][c];
+                // MB-interleaved (standard)
+                int mb = i / bpm, bl = i % bpm;
+                if (mb >= nmb || mb >= 256) break;
+                int mx = mb_scan_x[mb], my = mb_scan_y[mb];
+
+                if (cp->mb_size) {
+                    int bx = mx * 8, by = my * 8;
+                    for (int r = 0; r < 8; r++)
+                        for (int c = 0; c < 8; c++)
+                            if (by + r < ph && bx + c < pw)
+                                Y[by + r][bx + c] = block[r][c];
+                } else if (bl < 4) {
+                    int bx = mx * 16 + blk_orders[bord][bl][0] * 8;
+                    int by = my * 16 + blk_orders[bord][bl][1] * 8;
+                    for (int r = 0; r < 8; r++)
+                        for (int c = 0; c < 8; c++)
+                            if (by + r < ph && bx + c < pw)
+                                Y[by + r][bx + c] = block[r][c];
+                } else if (bl == 4) {
+                    for (int r = 0; r < 8; r++)
+                        for (int c = 0; c < 8; c++)
+                            if (my * 8 + r < ph / 2 && mx * 8 + c < pw / 2)
+                                Cb[my * 8 + r][mx * 8 + c] = block[r][c];
+                } else {
+                    for (int r = 0; r < 8; r++)
+                        for (int c = 0; c < 8; c++)
+                            if (my * 8 + r < ph / 2 && mx * 8 + c < pw / 2)
+                                Cr[my * 8 + r][mx * 8 + c] = block[r][c];
+                }
             }
         }
 
-        // Debug: save Y-only grayscale for first frame
-        if (frames_decoded == 0) {
-            FILE *yf = fopen("/tmp/pd_y_only.pgm", "wb");
+        // Debug: save Y/Cb/Cr planes for first frame per packet
+        static int y_save_count = 0;
+        if (frames_decoded == 0 && y_save_count < 3) {
+            int sn = y_save_count;
+            char _yname[64]; snprintf(_yname, sizeof _yname, "/tmp/pd_y_%02d.pgm", sn);
+            FILE *yf = fopen(_yname, "wb");
             if (yf) {
-                fprintf(yf, "P5\n%d %d\n255\n", PD_W, PD_H);
-                for (int yy = 0; yy < PD_H; yy++)
-                    fwrite(Y[yy], 1, PD_W, yf);
+                fprintf(yf, "P5\n%d %d\n255\n", pw, ph);
+                for (int yy = 0; yy < ph; yy++)
+                    fwrite(Y[yy], 1, pw, yf);
                 fclose(yf);
             }
+            // Save Cb and Cr planes too
+            char _cbname[64]; snprintf(_cbname, sizeof _cbname, "/tmp/pd_cb_%02d.pgm", sn);
+            FILE *cbf = fopen(_cbname, "wb");
+            if (cbf) {
+                fprintf(cbf, "P5\n%d %d\n255\n", pw/2, ph/2);
+                for (int yy = 0; yy < ph/2; yy++)
+                    fwrite(Cb[yy], 1, pw/2, cbf);
+                fclose(cbf);
+            }
+            char _crname[64]; snprintf(_crname, sizeof _crname, "/tmp/pd_cr_%02d.pgm", sn);
+            FILE *crf = fopen(_crname, "wb");
+            if (crf) {
+                fprintf(crf, "P5\n%d %d\n255\n", pw/2, ph/2);
+                for (int yy = 0; yy < ph/2; yy++)
+                    fwrite(Cr[yy], 1, pw/2, crf);
+                fclose(crf);
+            }
         }
+        if (frames_decoded == 0) y_save_count++;
 
         // YCbCr 4:2:0 → RGB888 into frame queue (centered in 320×240)
         if (v->fq_count < PD_FRAME_QUEUE_SIZE) {
             uint8_t *dst_buf = v->frame_queue[v->fq_write];
-            int ox = (SCREEN_W - PD_W) / 2;
-            int oy = (SCREEN_H - PD_H) / 2;
+            int ox = (SCREEN_W - pw) / 2;
+            int oy = (SCREEN_H - ph) / 2;
             memset(dst_buf, 0, SCREEN_W * SCREEN_H * 3);
 
-            for (int y = 0; y < PD_H; y++) {
-                for (int x = 0; x < PD_W; x++) {
+            for (int y = 0; y < ph; y++) {
+                for (int x = 0; x < pw; x++) {
                     int yv = Y[y][x];
-                    int cb = Cb[y / 2][x / 2] - 128;   // 4:2:0
+                    int cb = Cb[y / 2][x / 2] - 128;
                     int cr = Cr[y / 2][x / 2] - 128;
                     int dst = ((y + oy) * SCREEN_W + (x + ox)) * 3;
-                    dst_buf[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
-                    dst_buf[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
-                    dst_buf[dst + 2] = (uint8_t)pd_clamp(yv + (int)(1.772 * cb));
+                    if (y + oy >= 0 && y + oy < SCREEN_H && x + ox >= 0 && x + ox < SCREEN_W) {
+                        dst_buf[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
+                        dst_buf[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
+                        dst_buf[dst + 2] = (uint8_t)pd_clamp(yv + (int)(1.772 * cb));
+                    }
                 }
+            }
+
+            // Grid overlay
+            if (cp->grid_overlay) {
+                for (int y = 0; y < ph; y++) {
+                    for (int x = 0; x < pw; x++) {
+                        bool draw = false;
+                        if ((cp->grid_overlay & 1) && (x % 8 == 0 || y % 8 == 0))
+                            draw = true;  // 8x8 block grid
+                        if ((cp->grid_overlay & 2) && (x % 16 == 0 || y % 16 == 0))
+                            draw = true;  // MB grid
+                        if (draw) {
+                            int di = ((y + oy) * SCREEN_W + (x + ox)) * 3;
+                            if (y + oy >= 0 && y + oy < SCREEN_H && x + ox >= 0 && x + ox < SCREEN_W) {
+                                // Red for MB, green for block
+                                bool mb_line = (x % 16 == 0 || y % 16 == 0);
+                                dst_buf[di + 0] = mb_line ? 255 : 0;
+                                dst_buf[di + 1] = mb_line ? 0 : 255;
+                                dst_buf[di + 2] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bitstream stats overlay (bottom of image)
+            if (frames_decoded == 0) {
+                int pct = (bs.pos * 100) / (bs_total > 0 ? bs_total : 1);
+                printf("[VID] Bitstream: %d/%d bits used (%d%%), %d blocks decoded\n",
+                       bs.pos, bs_total, pct, nblocks);
             }
 
             v->fq_write = (v->fq_write + 1) % PD_FRAME_QUEUE_SIZE;

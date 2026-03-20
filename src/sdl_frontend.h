@@ -1,5 +1,6 @@
 #pragma once
 #include "playdia.h"
+#include "ak8000.h"
 #include <SDL2/SDL.h>
 #include <stdbool.h>
 
@@ -47,7 +48,12 @@ void sdl_queue_audio   (SDLFrontend *fe, const int16_t *samples, int n_samples);
 
 // Poll events, fill controller bitmask; returns false if quit
 bool sdl_poll_events   (SDLFrontend *fe, uint8_t *controller);
+// Extended: also handles codec tuning keys
+bool sdl_poll_events_ex(SDLFrontend *fe, uint8_t *controller, CodecParams *cp);
 
 // Keyboard → Playdia button map
 // Arrow keys → D-pad, Z=A, X=B, Enter=Start, Space=Select
 uint8_t sdl_key_to_btn (SDL_Keycode k);
+
+// Codec tuning key handler — returns true if key was consumed
+bool sdl_handle_codec_key(SDL_Keycode k, CodecParams *cp);
