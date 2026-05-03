@@ -41,7 +41,8 @@ static const char *cp_names[CODEC_PARAM_COUNT] = {
     "ac_count", "dc_mode", "dc_scale", "bs_offset",
     "width", "height", "level_shift", "use_eob", "ac_dequant",
     "scan_order", "block_order",
-    "dc_only", "grid", "chroma", "zigzag", "mb_size", "interleave"
+    "dc_only", "grid", "chroma", "zigzag", "mb_size", "interleave",
+    "vlc_invert"
 };
 
 void codec_params_init(CodecParams *cp) {
@@ -62,6 +63,7 @@ void codec_params_init(CodecParams *cp) {
     cp->zigzag_alt  = 0;    // standard MPEG-1
     cp->mb_size     = 0;    // 16x16
     cp->interleave  = 0;    // MB-interleaved
+    cp->vlc_invert  = 0;    // standard MPEG-1 size mapping
     cp->selected    = 0;
 }
 
@@ -84,6 +86,7 @@ void codec_params_adjust(CodecParams *cp, int delta) {
     case 14: cp->zigzag_alt   += delta; if (cp->zigzag_alt < 0) cp->zigzag_alt = 2; if (cp->zigzag_alt > 2) cp->zigzag_alt = 0; break;
     case 15: cp->mb_size      = cp->mb_size ? 0 : 1; break;
     case 16: cp->interleave  += delta; if (cp->interleave < 0) cp->interleave = 2; if (cp->interleave > 2) cp->interleave = 0; break;
+    case 17: cp->vlc_invert  = cp->vlc_invert ? 0 : 1; break;
     }
     codec_params_print(cp);
 }
@@ -105,7 +108,7 @@ void codec_params_print(const CodecParams *cp) {
         cp->width, cp->height, cp->level_shift, cp->use_eob, cp->ac_dequant,
         cp->scan_order, cp->block_order,
         cp->dc_only, cp->grid_overlay, cp->chroma_mode, cp->zigzag_alt, cp->mb_size,
-        cp->interleave
+        cp->interleave, cp->vlc_invert
     };
     for (int i = 0; i < CODEC_PARAM_COUNT; i++) {
         if (i == cp->selected)
@@ -242,6 +245,7 @@ static int at_get_val(const CodecParams *cp, int param) {
     case 14: return cp->zigzag_alt;
     case 15: return cp->mb_size;
     case 16: return cp->interleave;
+    case 17: return cp->vlc_invert;
     default: return 0;
     }
 }
@@ -267,6 +271,7 @@ static void at_set_val(CodecParams *cp, int param, int val) {
     case 14: cp->zigzag_alt = at_clamp(val, 0, 2); break;
     case 15: cp->mb_size    = at_clamp(val, 0, 1); break;
     case 16: cp->interleave = at_clamp(val, 0, 2); break;
+    case 17: cp->vlc_invert = at_clamp(val, 0, 1); break;
     }
 }
 
@@ -290,6 +295,7 @@ static int at_delta(int param) {
     case 14: return 1;    // zigzag: cycle
     case 15: return 1;    // mb_size: toggle
     case 16: return 1;    // interleave: cycle
+    case 17: return 1;    // vlc_invert: toggle
     default: return 1;
     }
 }
@@ -714,10 +720,30 @@ static int pd_bs_read(pd_bitstream *bs, int n) {
 // AK8000 VLC: MPEG-1 luminance DC VLC with modified sizes 7/8
 // Size 7 = 111110 (6 bits), Size 8 = 111111 (6 bits)
 // Both are 6 bits, differentiated by last bit (0=size7, 1=size8)
+// Set by decode_frame() to point at the active CodecParams so pd_read_vlc can
+// see vlc_invert without threading the param through every call site.
+static const CodecParams *pd_active_cp = NULL;
 static int pd_read_vlc(pd_bitstream *bs) {
     if (bs->pos >= bs->total_bits) return -9999;
     int size;
-    if (pd_bs_get1(bs) == 0) {
+    int invert = (pd_active_cp && pd_active_cp->vlc_invert) ? 1 : 0;
+    if (invert) {
+        // Inverted mapping: short codes → large sizes.
+        // 00→size 8, 01→size 7, 100→size 6, 101→size 5,
+        // 110→size 4, 1110→size 3, 11110→size 2, 111110→size 1, 111111→size 0
+        if (pd_bs_get1(bs) == 0) {
+            size = pd_bs_get1(bs) ? 7 : 8;
+        } else {
+            if (pd_bs_get1(bs) == 0) {
+                size = pd_bs_get1(bs) ? 5 : 6;
+            } else {
+                if (pd_bs_get1(bs) == 0) size = 4;
+                else if (pd_bs_get1(bs) == 0) size = 3;
+                else if (pd_bs_get1(bs) == 0) size = 2;
+                else size = pd_bs_get1(bs) ? 0 : 1;
+            }
+        }
+    } else if (pd_bs_get1(bs) == 0) {
         size = pd_bs_get1(bs) ? 2 : 1;          // 0x → 00=1, 01=2
     } else {
         if (pd_bs_get1(bs) == 0) {
@@ -789,6 +815,7 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
                                 int qscale, const uint8_t qtable[16],
                                 int init_y, int init_cb, int init_cr,
                                 const CodecParams *cp) {
+    pd_active_cp = cp;  // expose to pd_read_vlc()
     int nblocks = 0;
     int mbpx = cp->mb_size ? 8 : 16;  // MB pixel size
     int mw = cp->width / mbpx;

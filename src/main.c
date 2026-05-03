@@ -60,6 +60,8 @@ static void run_cpu_test(void) {
 // ─── Headless run (no SDL) ────────────────────────────────────
 static void run_headless(Playdia *p, uint32_t max_frames, bool autotune) {
     printf("[Headless] Running %u frames...\n", max_frames);
+    // Always print per-frame score so external sweepers can rank --codec runs.
+    double score_sum = 0; int score_n = 0;
 
     if (autotune) {
         CodecParams *cp = &p->video.codec_params;
@@ -85,13 +87,15 @@ static void run_headless(Playdia *p, uint32_t max_frames, bool autotune) {
         playdia_run_frame(p);
         pipeline_drain_audio(&p->pipe, &p->video);
 
-        // Auto-tune scoring
-        if (p->video.codec_params.autotune && p->video.got_video_frame) {
+        // Per-frame scoring (always, so external sweepers can read it).
+        if (p->video.got_video_frame) {
             CodecParams *cp = &p->video.codec_params;
             double score = codec_frame_score(
                 p->video.framebuffer, SCREEN_W, SCREEN_H,
                 cp->width, cp->height);
-            codec_autotune_step(cp, score);
+            score_sum += score; score_n++;
+            if (cp->autotune)
+                codec_autotune_step(cp, score);
         }
 
         // Save snapshot every 100 frames
@@ -125,6 +129,8 @@ static void run_headless(Playdia *p, uint32_t max_frames, bool autotune) {
         }
     }
     printf("[Headless] Done. %u frames total.\n", p->frames);
+    if (score_n > 0)
+        printf("[Headless] AvgScore=%.4f (n=%d)\n", score_sum / score_n, score_n);
     printf("[Headless] Final codec params:\n");
     codec_params_print(&p->video.codec_params);
 
@@ -232,6 +238,7 @@ int main(int argc, char *argv[]) {
             else if (strcmp(tok,"zigzag")==0)      cp->zigzag_alt = val;
             else if (strcmp(tok,"mb_size")==0)     cp->mb_size = val;
             else if (strcmp(tok,"interleave")==0) cp->interleave = val;
+            else if (strcmp(tok,"vlc_invert")==0) cp->vlc_invert = val;
             else fprintf(stderr, "Unknown codec param: %s\n", tok);
         }
         printf("[Main] Codec overrides applied:\n");

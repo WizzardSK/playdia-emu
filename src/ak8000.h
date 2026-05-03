@@ -62,6 +62,9 @@ typedef struct CodecParams {
     int  interleave;     // 0=MB-interleaved (4Y+Cb+Cr per MB)
                          // 1=plane (all Y, then all Cb, then all Cr)
                          // 2=Y-only (treat all blocks as Y)
+    int  vlc_invert;     // 0=normal MPEG-1 size mapping (short code -> small size)
+                         // 1=inverted (short code -> large size). Test: 6× wider DC
+                         //   diff std on Keroppi but with -29 mean bias.
 
     int  selected;       // currently selected param for UI
 
@@ -75,7 +78,7 @@ typedef struct CodecParams {
     bool save_frame;     // flag: save next frame to /tmp
 } CodecParams;
 
-#define CODEC_PARAM_COUNT 17
+#define CODEC_PARAM_COUNT 18
 
 void    codec_params_init   (CodecParams *cp);
 void    codec_params_adjust (CodecParams *cp, int delta);
