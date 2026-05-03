@@ -891,6 +891,7 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
                 dc_pred[comp] = dc_val;
             }
             coeff[nblocks][0] = dc_val * cp->dc_scale;
+            // DEBUG: dump first frame's first 8 blocks raw VLC + final coeffs
 
             // AC coefficients (skip if dc_only mode)
             if (cp->dc_only) {
