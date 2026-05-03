@@ -65,6 +65,8 @@ typedef struct CodecParams {
     int  vlc_invert;     // 0=normal MPEG-1 size mapping (short code -> small size)
                          // 1=inverted (short code -> large size). Test: 6× wider DC
                          //   diff std on Keroppi but with -29 mean bias.
+    int  dc_diff_mult;   // 0=raw diff, 1=diff*qscale, 2=diff*qtable[0]
+                         // Hypothesis: DC = init + diff × qscale gives needed range.
 
     int  selected;       // currently selected param for UI
 
@@ -78,7 +80,7 @@ typedef struct CodecParams {
     bool save_frame;     // flag: save next frame to /tmp
 } CodecParams;
 
-#define CODEC_PARAM_COUNT 18
+#define CODEC_PARAM_COUNT 19
 
 void    codec_params_init   (CodecParams *cp);
 void    codec_params_adjust (CodecParams *cp, int delta);

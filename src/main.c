@@ -239,6 +239,7 @@ int main(int argc, char *argv[]) {
             else if (strcmp(tok,"mb_size")==0)     cp->mb_size = val;
             else if (strcmp(tok,"interleave")==0) cp->interleave = val;
             else if (strcmp(tok,"vlc_invert")==0) cp->vlc_invert = val;
+            else if (strcmp(tok,"dc_diff_mult")==0) cp->dc_diff_mult = val;
             else fprintf(stderr, "Unknown codec param: %s\n", tok);
         }
         printf("[Main] Codec overrides applied:\n");

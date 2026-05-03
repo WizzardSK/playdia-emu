@@ -42,7 +42,7 @@ static const char *cp_names[CODEC_PARAM_COUNT] = {
     "width", "height", "level_shift", "use_eob", "ac_dequant",
     "scan_order", "block_order",
     "dc_only", "grid", "chroma", "zigzag", "mb_size", "interleave",
-    "vlc_invert"
+    "vlc_invert", "dc_diff_mult"
 };
 
 void codec_params_init(CodecParams *cp) {
@@ -64,6 +64,7 @@ void codec_params_init(CodecParams *cp) {
     cp->mb_size     = 0;    // 16x16
     cp->interleave  = 0;    // MB-interleaved
     cp->vlc_invert  = 0;    // standard MPEG-1 size mapping
+    cp->dc_diff_mult = 0;   // raw diff (no qscale multiplication)
     cp->selected    = 0;
 }
 
@@ -87,6 +88,7 @@ void codec_params_adjust(CodecParams *cp, int delta) {
     case 15: cp->mb_size      = cp->mb_size ? 0 : 1; break;
     case 16: cp->interleave  += delta; if (cp->interleave < 0) cp->interleave = 2; if (cp->interleave > 2) cp->interleave = 0; break;
     case 17: cp->vlc_invert  = cp->vlc_invert ? 0 : 1; break;
+    case 18: cp->dc_diff_mult += delta; if (cp->dc_diff_mult < 0) cp->dc_diff_mult = 2; if (cp->dc_diff_mult > 2) cp->dc_diff_mult = 0; break;
     }
     codec_params_print(cp);
 }
@@ -108,7 +110,7 @@ void codec_params_print(const CodecParams *cp) {
         cp->width, cp->height, cp->level_shift, cp->use_eob, cp->ac_dequant,
         cp->scan_order, cp->block_order,
         cp->dc_only, cp->grid_overlay, cp->chroma_mode, cp->zigzag_alt, cp->mb_size,
-        cp->interleave, cp->vlc_invert
+        cp->interleave, cp->vlc_invert, cp->dc_diff_mult
     };
     for (int i = 0; i < CODEC_PARAM_COUNT; i++) {
         if (i == cp->selected)
@@ -246,6 +248,7 @@ static int at_get_val(const CodecParams *cp, int param) {
     case 15: return cp->mb_size;
     case 16: return cp->interleave;
     case 17: return cp->vlc_invert;
+    case 18: return cp->dc_diff_mult;
     default: return 0;
     }
 }
@@ -272,6 +275,7 @@ static void at_set_val(CodecParams *cp, int param, int val) {
     case 15: cp->mb_size    = at_clamp(val, 0, 1); break;
     case 16: cp->interleave = at_clamp(val, 0, 2); break;
     case 17: cp->vlc_invert = at_clamp(val, 0, 1); break;
+    case 18: cp->dc_diff_mult = at_clamp(val, 0, 2); break;
     }
 }
 
@@ -296,6 +300,7 @@ static int at_delta(int param) {
     case 15: return 1;    // mb_size: toggle
     case 16: return 1;    // interleave: cycle
     case 17: return 1;    // vlc_invert: toggle
+    case 18: return 1;    // dc_diff_mult: cycle
     default: return 1;
     }
 }
@@ -875,7 +880,11 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
             int dc_val;
             if (cp->dc_mode == 0) {
                 // Mode 0: init+diff (no accumulation)
-                dc_val = inits[comp] + diff;
+                // dc_diff_mult is from new param: 0=raw diff, 1=diff*qscale, 2=diff*qtable[0]
+                int dscaled = diff;
+                if (cp->dc_diff_mult == 1) dscaled = diff * qscale;
+                else if (cp->dc_diff_mult == 2) dscaled = diff * qtable[0];
+                dc_val = inits[comp] + dscaled;
             } else {
                 // Mode 1: DPCM accumulate
                 dc_val = dc_pred[comp] + diff;
