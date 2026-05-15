@@ -94,6 +94,19 @@ double  codec_frame_score   (const uint8_t *framebuffer, int fb_w, int fb_h,
 // Auto-tune step — call once per frame after decode
 void    codec_autotune_step (CodecParams *cp, double score);
 
+// ── Reference-image scoring (for autotune against ground truth) ──
+// Load a PNG via ImageMagick `convert` into a 192×144 RGB buffer.
+// Returns true on success.  The bundled `reference/pd_real_*.png`
+// files are the intended input.
+bool    codec_load_reference(const char *png_path,
+                             uint8_t *out_rgb, int w, int h);
+// Pearson correlation between the decoded video region (centered
+// 192×144 inside the 320×240 framebuffer) and a reference image of
+// the same dimensions.  Returns a value in [-1, +1]; ~0 = noise,
+// 0.5+ = visible correlation.
+double  codec_pearson_score(const uint8_t *framebuffer, int fb_w, int fb_h,
+                            const uint8_t *ref_rgb, int ref_w, int ref_h);
+
 typedef struct AK8000 {
     // ── Registers ─────────────────────────────────────────
     uint8_t  regs[16];

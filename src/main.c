@@ -58,10 +58,29 @@ static void run_cpu_test(void) {
 }
 
 // ─── Headless run (no SDL) ────────────────────────────────────
-static void run_headless(Playdia *p, uint32_t max_frames, bool autotune) {
+//
+//  If `ref_path` is non-NULL, autotune uses Pearson-vs-reference
+//  scoring instead of the heuristic codec_frame_score().  This is
+//  the only objective fidelity metric we have — the heuristic score
+//  rewards entropy/structure and can be gamed by the optimizer.
+//
+static uint8_t g_ref_rgb[192 * 144 * 3];
+static bool    g_ref_loaded = false;
+static int     g_ref_w = 192, g_ref_h = 144;
+
+static void run_headless(Playdia *p, uint32_t max_frames, bool autotune,
+                         const char *ref_path) {
     printf("[Headless] Running %u frames...\n", max_frames);
-    // Always print per-frame score so external sweepers can rank --codec runs.
     double score_sum = 0; int score_n = 0;
+
+    if (ref_path) {
+        g_ref_loaded = codec_load_reference(ref_path, g_ref_rgb,
+                                            g_ref_w, g_ref_h);
+        if (g_ref_loaded)
+            printf("[Headless] Pearson-vs-reference scoring ENABLED\n");
+        else
+            printf("[Headless] Reference load FAILED — falling back to heuristic score\n");
+    }
 
     if (autotune) {
         CodecParams *cp = &p->video.codec_params;
@@ -69,7 +88,7 @@ static void run_headless(Playdia *p, uint32_t max_frames, bool autotune) {
         cp->tune_param = 0;
         cp->tune_step = 0;
         cp->tune_wait = 10; // let a few frames decode first
-        cp->best_score = 0;
+        cp->best_score = -2.0;  // Pearson can be negative; start below floor
         cp->stale_count = 0;
         printf("[TUNE] Auto-tune ENABLED in headless mode\n");
         codec_params_print(cp);
@@ -90,9 +109,16 @@ static void run_headless(Playdia *p, uint32_t max_frames, bool autotune) {
         // Per-frame scoring (always, so external sweepers can read it).
         if (p->video.got_video_frame) {
             CodecParams *cp = &p->video.codec_params;
-            double score = codec_frame_score(
-                p->video.framebuffer, SCREEN_W, SCREEN_H,
-                cp->width, cp->height);
+            double score;
+            if (g_ref_loaded) {
+                score = codec_pearson_score(
+                    p->video.framebuffer, SCREEN_W, SCREEN_H,
+                    g_ref_rgb, g_ref_w, g_ref_h);
+            } else {
+                score = codec_frame_score(
+                    p->video.framebuffer, SCREEN_W, SCREEN_H,
+                    cp->width, cp->height);
+            }
             score_sum += score; score_n++;
             if (cp->autotune)
                 codec_autotune_step(cp, score);
@@ -183,10 +209,15 @@ int main(int argc, char *argv[]) {
     bool autotune = false;
 
     const char *codec_str = NULL;
+    const char *ref_path  = NULL;
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--debug")    == 0) debug    = true;
         else if (strcmp(argv[i], "--headless") == 0) headless = true;
         else if (strcmp(argv[i], "--autotune") == 0) { autotune = true; headless = true; }
+        else if (strncmp(argv[i], "--reference", 11) == 0) {
+            if (argv[i][11] == '=') ref_path = argv[i] + 12;
+            else if (i + 1 < argc) ref_path = argv[++i];
+        }
         else if (strncmp(argv[i], "--codec", 7) == 0) {
             if (argv[i][7] == '=' ) codec_str = argv[i] + 8;
             else if (i + 1 < argc) codec_str = argv[++i];
@@ -250,7 +281,7 @@ int main(int argc, char *argv[]) {
 
     // ── Headless mode ─────────────────────────────────────
     if (headless) {
-        run_headless(playdia, autotune ? 1500 : 600, autotune);
+        run_headless(playdia, autotune ? 1500 : 600, autotune, ref_path);
         free(playdia);
         return 0;
     }
@@ -259,7 +290,7 @@ int main(int argc, char *argv[]) {
     SDLFrontend fe;
     if (sdl_init(&fe, "Playdia Emulator") != 0) {
         fprintf(stderr, "[Main] SDL init failed — falling back to headless\n");
-        run_headless(playdia, 300, false);
+        run_headless(playdia, 300, false, NULL);
         free(playdia);
         return 0;
     }

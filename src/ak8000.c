@@ -417,6 +417,84 @@ void codec_autotune_step(CodecParams *cp, double score) {
     }
 }
 
+/* ── Reference-image scoring helpers ─────────────────────────────
+ *  Load a PNG by piping through ImageMagick `convert` so we don't
+ *  need libpng linked here.  Output is a tight 192×144 RGB888 buffer.
+ *  Falls back to libavcodec PNG if convert is missing? — for now
+ *  just require `convert` on PATH (we already use it for headless
+ *  framebuffer dumps).
+ */
+bool codec_load_reference(const char *png_path, uint8_t *out_rgb, int w, int h) {
+    if (!png_path || !out_rgb || w <= 0 || h <= 0) return false;
+    char cmd[1024];
+    const char *ppm_path = "/tmp/pd_ref_loaded.ppm";
+    /* `convert <png> -resize WxH! <ppm>` — `!` ignores aspect ratio */
+    snprintf(cmd, sizeof cmd,
+             "convert %s -resize %dx%d\\! -depth 8 ppm:%s 2>/dev/null",
+             png_path, w, h, ppm_path);
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "[REF] convert failed (rc=%d) for %s\n", rc, png_path);
+        return false;
+    }
+    FILE *f = fopen(ppm_path, "rb");
+    if (!f) {
+        fprintf(stderr, "[REF] cannot open %s\n", ppm_path);
+        return false;
+    }
+    char magic[3] = {0};
+    int pw = 0, ph = 0, maxv = 0;
+    if (fscanf(f, "%2s\n%d %d\n%d\n", magic, &pw, &ph, &maxv) != 4 ||
+        magic[0] != 'P' || magic[1] != '6' || pw != w || ph != h || maxv != 255) {
+        fprintf(stderr, "[REF] bad PPM header (%s, magic=%s pw=%d ph=%d maxv=%d)\n",
+                ppm_path, magic, pw, ph, maxv);
+        fclose(f);
+        return false;
+    }
+    size_t need = (size_t)w * h * 3;
+    size_t got  = fread(out_rgb, 1, need, f);
+    fclose(f);
+    if (got != need) {
+        fprintf(stderr, "[REF] short read: got %zu of %zu\n", got, need);
+        return false;
+    }
+    printf("[REF] Loaded %s as %dx%d RGB (%zu bytes)\n", png_path, w, h, need);
+    return true;
+}
+
+double codec_pearson_score(const uint8_t *fb, int fbw, int fbh,
+                           const uint8_t *ref, int rw, int rh) {
+    if (!fb || !ref || fbw <= 0 || fbh <= 0 || rw <= 0 || rh <= 0)
+        return 0.0;
+    /* Pick the centred rw×rh region of fb. */
+    int ox = (fbw - rw) / 2;
+    int oy = (fbh - rh) / 2;
+    if (ox < 0 || oy < 0) return 0.0;
+
+    /* Single-pass Pearson on all 3 channels jointly. */
+    double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    size_t n = 0;
+    for (int y = 0; y < rh; y++) {
+        const uint8_t *frow = fb  + ((oy + y) * fbw + ox) * 3;
+        const uint8_t *rrow = ref + y * rw * 3;
+        for (int x = 0; x < rw * 3; x++) {
+            double a = frow[x];
+            double b = rrow[x];
+            sx += a; sy += b;
+            sxx += a * a; syy += b * b;
+            sxy += a * b;
+            n++;
+        }
+    }
+    if (n == 0) return 0.0;
+    double mx = sx / n, my = sy / n;
+    double vx = sxx / n - mx * mx;
+    double vy = syy / n - my * my;
+    if (vx < 1e-9 || vy < 1e-9) return 0.0;
+    double cov = sxy / n - mx * my;
+    return cov / sqrt(vx * vy);
+}
+
 void ak8000_init(AK8000 *v) {
     memset(v, 0, sizeof *v);
     codec_params_init(&v->codec_params);
