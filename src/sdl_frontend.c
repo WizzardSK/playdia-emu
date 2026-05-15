@@ -110,15 +110,23 @@ void sdl_shutdown(SDLFrontend *fe) {
 // ─────────────────────────────────────────────────────────────
 bool sdl_present_frame(SDLFrontend *fe, const uint8_t *rgb888, int w, int h) {
     if (!fe->running) return false;
+    (void)h;
 
-    // Upload pixels — RGB24 pitch = w*3
+    // Upload the whole 320×240 framebuffer into the texture.
     SDL_UpdateTexture(fe->texture, NULL, rgb888, w * 3);
 
     SDL_RenderClear(fe->renderer);
-    SDL_RenderCopy(fe->renderer, fe->texture, NULL, NULL);
 
-    // ── OSD: frame counter in top-left ────────────────────
-    // (no font rendering — just present the frame)
+    // Stretch the centered 192×144 video region to fill the entire
+    // window, no black borders.  Source rect picks just the active
+    // video area inside the 320×240 framebuffer.
+    int vid_w = 192;
+    int vid_h = 144;
+    int ox    = (SCREEN_W - vid_w) / 2;
+    int oy    = (SCREEN_H - vid_h) / 2;
+    SDL_Rect src = { ox, oy, vid_w, vid_h };
+    SDL_RenderCopy(fe->renderer, fe->texture, &src, NULL);
+
     SDL_RenderPresent(fe->renderer);
 
     fe->frame_count++;
