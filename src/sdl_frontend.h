@@ -55,5 +55,8 @@ bool sdl_poll_events_ex(SDLFrontend *fe, uint8_t *controller, CodecParams *cp);
 // Arrow keys → D-pad, Z=A, X=B, Enter=Start, Space=Select
 uint8_t sdl_key_to_btn (SDL_Keycode k);
 
-// Codec tuning key handler — returns true if key was consumed
-bool sdl_handle_codec_key(SDL_Keycode k, CodecParams *cp);
+// Codec tuning key handler — returns true if key was consumed.
+// The "_fe" variant also refreshes the window title with the new
+// selected/value pair so live tuning is visible in the GUI.
+bool sdl_handle_codec_key   (SDL_Keycode k, CodecParams *cp);
+bool sdl_handle_codec_key_fe(SDLFrontend *fe, SDL_Keycode k, CodecParams *cp);

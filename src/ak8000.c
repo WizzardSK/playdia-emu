@@ -104,7 +104,6 @@ void codec_params_prev(CodecParams *cp) {
 }
 
 void codec_params_print(const CodecParams *cp) {
-    printf("\n[CODEC] ");
     int vals[CODEC_PARAM_COUNT] = {
         cp->ac_count, cp->dc_mode, cp->dc_scale, cp->bs_offset,
         cp->width, cp->height, cp->level_shift, cp->use_eob, cp->ac_dequant,
@@ -112,6 +111,12 @@ void codec_params_print(const CodecParams *cp) {
         cp->dc_only, cp->grid_overlay, cp->chroma_mode, cp->zigzag_alt, cp->mb_size,
         cp->interleave, cp->vlc_invert, cp->dc_diff_mult
     };
+    /* Prominent one-line summary of the currently-tuned param so it
+     * stands out in scroll-back during a live tuning session. */
+    printf("\n\033[1;33m[TUNE] >>> %s = %d <<<\033[0m   [param %d/%d]\n",
+           cp_names[cp->selected], vals[cp->selected],
+           cp->selected + 1, CODEC_PARAM_COUNT);
+    printf("[CODEC] ");
     for (int i = 0; i < CODEC_PARAM_COUNT; i++) {
         if (i == cp->selected)
             printf(">>%s=%d<< ", cp_names[i], vals[i]);
