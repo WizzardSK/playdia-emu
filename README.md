@@ -220,27 +220,6 @@ The PC-FX RAINBOW decoder (reversed by David Michel, implemented in Mednafen) us
 
 The Playdia AK8000 likely uses a similar DCT+VLC architecture but with unknown custom tables.
 
-### RAINBOW port experiment (2026-05-15)
-
-A direct port of Mednafen's RAINBOW decoder (`src/rainbow_decoder.c` +
-`src/rainbow_*.inc`, GPL-2.0+) is available as a runtime toggle
-(`--codec rainbow_mode=1`).  The full RAINBOW codec — 4 Huffman LUTs
-(DC luma 9-bit, DC chroma 8-bit, AC luma/chroma 12-bit), DPCM DC,
-run-level AC, TL/BL/TR/BR Y order, `coeff × qtable[pos]` dequant,
-+128 level shift — applied verbatim to AK8000 bitstreams produces:
-
-- Visibly different output across discs (so the decoder genuinely
-  consumes the bitstream — it's not falling back to defaults).
-- Strong horizontal banding on Keroppi, dense colour noise on Bandai
-  Item Collection — structurally plausible DCT garbage, but not
-  recognizable content.
-- Conclusion: **AK8000 does NOT share RAINBOW's exact Huffman tables**.
-  The architecture (DCT blocks, MB layout) may be compatible but the
-  size-prefix / run-level coding tables differ.
-
-The infrastructure is left in place as a known-ruled-out reference
-point and as a starting framework for testing other table variants.
-
 ### What's Needed to Solve
 
 - **Hardware capture**: Record Playdia composite video output synchronized with disc sector reads to create ground-truth input/output pairs
