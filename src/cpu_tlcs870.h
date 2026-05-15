@@ -36,18 +36,19 @@
 #define FLAG_S   FLAG_J
 
 /* Register-file indices within the active RBS bank (8 GPRs).
- *   TLCS-870 register ordering (low → high address):
- *     E, D, L, H, A, W, C, B
- *   Pair registers: WA (A+W), BC, DE, HL */
+ *   MAME-compatible TLCS-870 register ordering (low → high addr):
+ *     A, W, C, B, E, D, L, H
+ *   Pair registers (low byte first / high byte second):
+ *     WA = (W:A)   BC = (B:C)   DE = (D:E)   HL = (H:L)            */
 enum {
-    TLCS870_REG_E = 0,
-    TLCS870_REG_D = 1,
-    TLCS870_REG_L = 2,
-    TLCS870_REG_H = 3,
-    TLCS870_REG_A = 4,
-    TLCS870_REG_W = 5,
-    TLCS870_REG_C = 6,
-    TLCS870_REG_B = 7,
+    TLCS870_REG_A = 0,
+    TLCS870_REG_W = 1,
+    TLCS870_REG_C = 2,
+    TLCS870_REG_B = 3,
+    TLCS870_REG_E = 4,
+    TLCS870_REG_D = 5,
+    TLCS870_REG_L = 6,
+    TLCS870_REG_H = 7,
 };
 
 typedef struct CPU_TLCS870 {

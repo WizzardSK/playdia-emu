@@ -5,7 +5,7 @@ Emulator for the **Bandai Playdia** (1994), an obscure Japanese FMV console.
 ## Hardware
 - **Console**: Bandai Playdia Quick Interactive System (1994)
 - **Main CPU**: Toshiba TLCS-870 @ 8MHz
-- **I/O CPU**: NEC µPD78214 (78K/0) @ 12MHz
+- **I/O CPU**: NEC µPD78214GC (78K/**II** family) @ 12MHz
 - **Video/Audio**: Asahi Kasei AK8000 custom ASIC (no datasheet exists)
 - **Video DAC**: Philips TDA8772AH Triple 8-bit (CD-i compatible)
 - **Media**: CD-ROM XA Mode 2
@@ -33,8 +33,8 @@ Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Ful
 
 | Component | Status |
 |-----------|--------|
-| TLCS-870 CPU | Basic instruction set |
-| NEC 78K/0 CPU | Basic instruction set |
+| TLCS-870 CPU | Substantial subset ported from MAME (BSD-3-Clause, David Haywood). Direct opcodes + e0/e8/f0/ff prefix families implemented. |
+| NEC 78K/II CPU | Substantial subset of the µPD78214GC ISA per the 78K/II manual (opcode encoding cross-checked against MAME's `upd78k2d` disassembler — MAME has no execution core). |
 | CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
 | BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
 | Video decode | **AK8000 proprietary DCT codec** — DC offset + fixed 10 AC per block, modified MPEG-1 VLC |
@@ -245,3 +245,67 @@ Real hardware screenshots in `reference/` directory:
 - `pd_real_suzu.png` — Ie Naki Ko live-action FMV
 - `pd_real_keroppi.png` — Kero Kero Keroppi animation
 - `pd_real_forest.png` — Forest Sways title screen
+
+---
+
+## CPU Cores
+
+### TLCS-870 (main CPU)
+
+`src/cpu_tlcs870.c` is a C port of [MAME](https://www.mamedev.org)'s
+[TLCS-870 core](https://github.com/mamedev/mame/tree/master/src/devices/cpu/tlcs870),
+originally written by **David Haywood** under the BSD-3-Clause license.
+The C port adapts MAME's C++ implementation to work without MAME's framework
+(no `device_t`, no `address_space` — operates directly on a `uint8_t mem[64K]`
+mirror provided by the host).
+
+Coverage: all single-byte primary opcodes, plus the `0xE0..0xE7` source-prefix,
+`0xE8..0xEF` reg-prefix, `0xF0..0xF7` dst-prefix, and `0xFF` SWI families.
+Flag handling matches MAME's documented `JF/ZF/CF/HF` semantics with the spec's
+"JF = CF for ADD/SUB" rule (MAME's own implementation has a typo here; the
+comment in the source documents the correct intent).
+
+Reset reads the vector at `0xFFFE..0xFFFF`. Interrupts vector through
+`0xFFE0..0xFFFF` (16 entries, priorities 0..15 with priority 15 being RESET).
+RBS-banked register file lives at `0x40 + RBS*8`.
+
+### NEC µPD78214GC (78K/II I/O CPU)
+
+`src/cpu_nec78k.c` is hand-written against the NEC 78K/II Instructions User's
+Manual, with opcode encoding cross-checked against MAME's `upd78k2d`
+disassembler (MAME has no execution core for this CPU family —
+`upd78k2.cpp` is explicitly tagged `"Currently these devices are just stubs
+with no actual execution core."`).
+
+Implemented opcode families:
+- 1-byte direct ops: `INC/DEC r`, `INCW/DECW rp`, `MOV A,r`, `XCH A,r`,
+  `PUSH/POP rp`, `PUSH/POP PSW`, `DI/EI`, `RET/RETI/RETB/BRK`, `INCW SP /
+  DECW SP`, `MOV [DE/HL +/-/=],A` and inverse, `CALLT [tbl]`
+- ALU `A,#imm / A,saddr / A,saddr_to_saddr / r,r' / AX,#word16 / AX,saddrp`
+  in all eight variants (ADD, ADDC, SUB, SUBC, AND, XOR, OR, CMP)
+- 16-bit ALU `ADDW / SUBW / CMPW AX,#word16 / AX,saddrp / AX,rp`
+- `MOVW` in all variants (rp,#word / sfrp,#word / saddrp,#word / AX,sfrp /
+  AX,saddrp / sfrp,AX / saddrp,AX / rp,rp' / AX,[DE]/[HL] indirect)
+- Branches: `BR$rel8 / BR!addr16 / BNZ/BZ/BNC/BC / DBNZ r / DBNZ saddr /
+  CALLF !addr / CALL !addr16 / CALL rp / BR rp / CALLT [tbl]`
+- Bit ops: `SET1/CLR1/NOT1 CY / saddr.bit / PSW.bit / r.bit`,
+  `MOV1/AND1/OR1/XOR1 CY,<bit>` and inverse, `BT/BF/BTCLR <bit>,$rel8` for
+  saddr/sfr/PSW/r forms
+- Shifts/rotates: `RORC/ROR/SHR/SHRW/ROLC/ROL/SHL/SHLW r/rp,n` via the 0x30/0x31
+  prefix
+- Indirect addressing: `[base+disp8]` (DE/SP/HL), `word[A] / word[B]` indexed,
+  `word[DE] / word[HL]` 16-bit-displaced, `[DE+]/[HL+]/[DE-]/[HL-]` auto-mod
+- `MULU r / DIVUW r` (78K/II extensions)
+- `SEL RB0..RB3` register-bank switching
+- `MOV STBC,#imm` (write-protected SFR) drives HALT/STOP via bits 0/1
+- `BRK / RETB` (software interrupt + return)
+
+Reset reads vector at `mem[0x0000..0x0001]`; PSW initialised to `0x02`; SP
+starts at `0xFEDF`. Register banks at `0xFEF8/0xFEF0/0xFEE8/0xFEE0` for
+RB0..RB3 per MAME's `register_base()` computation. CALLT table at
+`0x0040..0x007E`.
+
+Not yet implemented: the `&` (alternate-bank, prefix `0x01 0x05/0x06/0x09/0x0A/
+0x16/0x5x`) expansion-memory forms. The 1 MB physical space is paged via the
+external MM SFR at `0xFFC4` (host responsibility — the CPU core itself only
+sees the current 64 KB window).

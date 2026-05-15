@@ -3,60 +3,90 @@
 
 /* ============================================================
  *  NEC µPD78214GC — 78K/II series CPU core (Playdia sub-CPU)
- *  12 MHz, handles CD-ROM control & I/O
+ *  12 MHz, handles CD-ROM control & I/O.
  *
- *  Reference: NEC 78K/II Instruction User's Manual
- *             https://docs.alexrp.com/78k/78k_ii.pdf
+ *  Reference: NEC 78K/II Instructions User's Manual
+ *             (U10905EJ et al.); cross-checked against MAME
+ *             `src/devices/cpu/upd78k/upd78k2d.cpp` (disassembler
+ *             only — MAME has no 78K/II execution core).
  *
- *  78K/II is NOT 78K/0.  Key differences:
- *    - 1 MB segmented address space (20-bit physical)
- *      Code accesses use PC + CS-segment-equivalent (PMC[4:0])
- *    - Extended instruction set: MULU, DIVUW, BR/CALL !!addr20,
- *      MOV PSW,#byte, MOV ES,A, etc.
- *    - 4 register banks at 0xFEEx–0xFEFx (was 1 in 78K/S, 2 in 78K/0)
- *    - PSW adds RBS2 (3 bank-select bits total) and ISP fields
+ *  Key architectural facts about 78K/II that differ from
+ *  78K/0:
+ *    - 1 MB physical address space, but the ISA is still 16-bit
+ *      addressed: pages outside the current 64 KB window are
+ *      reached via the external MM (Memory Mapping) SFR at
+ *      0xFFC4.  Code does NOT carry segment registers like
+ *      CS/ES — that was the 78K/III, IV.
+ *    - **4 register banks** (RB0..RB3), selected by PSW.RBS1
+ *      (bit 5) and PSW.RBS0 (bit 3).  RB0 lives at the HIGHEST
+ *      IRAM offset (0xFEF8) and RB3 at the lowest (0xFEE0).
+ *    - Extended instruction set vs 78K/0: MULU, DIVUW, BRK/RETB,
+ *      [SP+disp8] / [HL+disp8] / [DE+disp8] addressing,
+ *      `word[A]` / `word[B]` indexed forms, MOV saddr,saddr.
  *
- *  Register file (per bank, mapped at 0xFEE0–0xFEFF):
- *    r[0]=X r[1]=A r[2]=C r[3]=B r[4]=E r[5]=D r[6]=L r[7]=H
- *  Pair registers:
- *    rp0=AX  rp1=BC  rp2=DE  rp3=HL
+ *  Register file (per RBS bank, 8 bytes):
+ *    offset +0 = X   +1 = A   +2 = C   +3 = B
+ *    offset +4 = E   +5 = D   +6 = L   +7 = H
+ *  Pair registers (little-endian within the pair):
+ *    AX = X:A   BC = C:B   DE = E:D   HL = L:H
  *
- *  This implementation is a WORK-IN-PROGRESS skeleton with the
- *  correct 78K/II architecture.  Many opcodes are still TODO and
- *  fall through to a NOP-equivalent.  See cpu_nec78k.c.
+ *  PSW byte (bit 7..0):
+ *    bit 7 = IE   (interrupt enable)
+ *    bit 6 = Z    (zero)
+ *    bit 5 = RBS1 (register-bank select bit 1)
+ *    bit 4 = AC   (auxiliary carry)
+ *    bit 3 = RBS0 (register-bank select bit 0)
+ *    bit 2 = reserved (reads 0)
+ *    bit 1 = ISP  (in-service priority)
+ *    bit 0 = CY   (carry)
  * ============================================================ */
 
-/* PSW bits (78K/II) */
-#define NEC_CY   0x01      /* carry                          */
-#define NEC_ISP  0x02      /* in-service priority            */
-#define NEC_AC   0x04      /* auxiliary carry                */
-#define NEC_RBS0 0x08      /* register bank select bit 0     */
-#define NEC_RBS1 0x10      /* register bank select bit 1     */
-#define NEC_RBS2 0x20      /* register bank select bit 2     */
-#define NEC_Z    0x40      /* zero                           */
-#define NEC_IE   0x80      /* interrupt enable               */
+/* PSW bit masks (matches the on-chip PSW layout) */
+#define NEC_CY    0x01
+#define NEC_ISP   0x02
+#define NEC_RBS0  0x08
+#define NEC_AC    0x10
+#define NEC_RBS1  0x20
+#define NEC_Z     0x40
+#define NEC_IE    0x80
+
+/* Register indices within a bank (X=0..H=7, MAME 78K/0 order) */
+enum {
+    NEC78K_REG_X = 0,
+    NEC78K_REG_A = 1,
+    NEC78K_REG_C = 2,
+    NEC78K_REG_B = 3,
+    NEC78K_REG_E = 4,
+    NEC78K_REG_D = 5,
+    NEC78K_REG_L = 6,
+    NEC78K_REG_H = 7,
+};
+/* Pair indices (low/high in the 2-byte slot) */
+enum {
+    NEC78K_PAIR_AX = 0,   /* X:A  → low=X, high=A — careful  */
+    NEC78K_PAIR_BC = 1,
+    NEC78K_PAIR_DE = 2,
+    NEC78K_PAIR_HL = 3,
+};
 
 typedef struct CPU_NEC78K {
-    /* register file – 8 banks of 8 GPRs, mapped at 0xFEE0..0xFEFF */
-    uint8_t  r[8];            /* current bank (mirrored from RAM) */
-
-    /* program counter is 16-bit within the current 64KB segment.
-     * The 78K/II adds a 4-bit code segment (CS / "PMC[3:0]") for
-     * 1 MB physical addressing.  Most Playdia code stays in CS=0. */
-    uint16_t PC;
-    uint8_t  CS;              /* code segment (0..15)             */
-
-    uint16_t SP;
+    /* PSW + scalar mirror of the current bank's GPRs.  Kept in
+     * sync with RAM at the start of every step() so external
+     * writes through cpu->r[i] are visible to opcode handlers,
+     * and after every step() so external readers see the new
+     * register state.  Banked RAM mirror lives at 0xFEE0..0xFEFF
+     * within mem[].  */
+    uint8_t  r[8];          /* active bank: X,A,C,B,E,D,L,H        */
+    uint16_t PC, SP;
     uint8_t  PSW;
-
-    /* extra-data segment for `MOV A,ES:[addr]` style accesses */
-    uint8_t  ES;
-
     bool     halted, stopped;
-    uint8_t  bank;            /* 0..7  (decoded from PSW.RBS2..0)  */
+    uint8_t  bank;          /* 0..3, decoded from PSW.RBS{0,1}     */
     uint8_t  port[16];
 
-    uint8_t *mem;             /* 64KB current segment view         */
+    /* Memory window currently visible to the core. Always 64 KB
+     * — the host (interconnect.c) decides what physical page is
+     * mapped via the MM SFR at 0xFFC4.                            */
+    uint8_t *mem;
     uint64_t cycles;
 } CPU_NEC78K;
 
