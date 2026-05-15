@@ -12,6 +12,7 @@ SRCS = src/main.c \
        src/cpu_nec78k.c \
        src/cdrom.c \
        src/ak8000.c \
+       src/rainbow_decoder.c \
        src/zip_stream.c \
        src/interconnect.c \
        src/pipeline.c \

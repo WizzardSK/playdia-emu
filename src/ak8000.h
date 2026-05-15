@@ -67,6 +67,11 @@ typedef struct CodecParams {
                          //   diff std on Keroppi but with -29 mean bias.
     int  dc_diff_mult;   // 0=raw diff, 1=diff*qscale, 2=diff*qtable[0]
                          // Hypothesis: DC = init + diff × qscale gives needed range.
+    int  rainbow_mode;   // 0=native AK8000 decoder, 1=PC-FX RAINBOW decoder
+                         // (Mednafen tables + DPCM DC + run-level AC, see
+                         //  src/rainbow_decoder.c).  Experimental — if AK8000
+                         //  shares David Michel's codec spec with PC-FX KING,
+                         //  this should produce recognizable images.
 
     int  selected;       // currently selected param for UI
 
@@ -80,7 +85,7 @@ typedef struct CodecParams {
     bool save_frame;     // flag: save next frame to /tmp
 } CodecParams;
 
-#define CODEC_PARAM_COUNT 19
+#define CODEC_PARAM_COUNT 20
 
 void    codec_params_init   (CodecParams *cp);
 void    codec_params_adjust (CodecParams *cp, int delta);

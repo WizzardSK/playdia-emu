@@ -42,7 +42,7 @@ static const char *cp_names[CODEC_PARAM_COUNT] = {
     "width", "height", "level_shift", "use_eob", "ac_dequant",
     "scan_order", "block_order",
     "dc_only", "grid", "chroma", "zigzag", "mb_size", "interleave",
-    "vlc_invert", "dc_diff_mult"
+    "vlc_invert", "dc_diff_mult", "rainbow_mode"
 };
 
 void codec_params_init(CodecParams *cp) {
@@ -65,6 +65,7 @@ void codec_params_init(CodecParams *cp) {
     cp->interleave  = 0;    // MB-interleaved
     cp->vlc_invert  = 0;    // standard MPEG-1 size mapping
     cp->dc_diff_mult = 0;   // raw diff (no qscale multiplication)
+    cp->rainbow_mode = 0;   // off; use native AK8000 decoder
     cp->selected    = 0;
 }
 
@@ -89,6 +90,7 @@ void codec_params_adjust(CodecParams *cp, int delta) {
     case 16: cp->interleave  += delta; if (cp->interleave < 0) cp->interleave = 2; if (cp->interleave > 2) cp->interleave = 0; break;
     case 17: cp->vlc_invert  = cp->vlc_invert ? 0 : 1; break;
     case 18: cp->dc_diff_mult += delta; if (cp->dc_diff_mult < 0) cp->dc_diff_mult = 2; if (cp->dc_diff_mult > 2) cp->dc_diff_mult = 0; break;
+    case 19: cp->rainbow_mode = cp->rainbow_mode ? 0 : 1; break;
     }
     codec_params_print(cp);
 }
@@ -110,7 +112,7 @@ void codec_params_print(const CodecParams *cp) {
         cp->width, cp->height, cp->level_shift, cp->use_eob, cp->ac_dequant,
         cp->scan_order, cp->block_order,
         cp->dc_only, cp->grid_overlay, cp->chroma_mode, cp->zigzag_alt, cp->mb_size,
-        cp->interleave, cp->vlc_invert, cp->dc_diff_mult
+        cp->interleave, cp->vlc_invert, cp->dc_diff_mult, cp->rainbow_mode
     };
     for (int i = 0; i < CODEC_PARAM_COUNT; i++) {
         if (i == cp->selected)
@@ -249,6 +251,7 @@ static int at_get_val(const CodecParams *cp, int param) {
     case 16: return cp->interleave;
     case 17: return cp->vlc_invert;
     case 18: return cp->dc_diff_mult;
+    case 19: return cp->rainbow_mode;
     default: return 0;
     }
 }
@@ -276,6 +279,7 @@ static void at_set_val(CodecParams *cp, int param, int val) {
     case 16: cp->interleave = at_clamp(val, 0, 2); break;
     case 17: cp->vlc_invert = at_clamp(val, 0, 1); break;
     case 18: cp->dc_diff_mult = at_clamp(val, 0, 2); break;
+    case 19: cp->rainbow_mode = at_clamp(val, 0, 1); break;
     }
 }
 
@@ -301,6 +305,7 @@ static int at_delta(int param) {
     case 16: return 1;    // interleave: cycle
     case 17: return 1;    // vlc_invert: toggle
     case 18: return 1;    // dc_diff_mult: cycle
+    case 19: return 1;    // rainbow_mode: toggle
     default: return 1;
     }
 }
@@ -948,6 +953,11 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
     return nblocks;
 }
 
+extern bool rainbow_decode_frame(const uint8_t *bitstream, int bytes,
+                                  const uint8_t qtable[16], int qscale,
+                                  uint8_t *rgb_out, int out_stride,
+                                  int width, int height);
+
 static void playdia_decode_video_frame(AK8000 *v) {
     if (v->vid_frame_pos < 40) return;
 
@@ -967,6 +977,34 @@ static void playdia_decode_video_frame(AK8000 *v) {
     uint8_t qscale = f[3];
     memcpy(v->qtable, f + 4, 16);
     v->qscale = qscale;
+
+    // ── PC-FX RAINBOW experiment path ────────────────────────────
+    // If rainbow_mode is on, we hand the bitstream verbatim to the
+    // Mednafen-derived decoder (see src/rainbow_decoder.c).  The
+    // output goes into the centered 192×144 region of the 320×240
+    // RGB framebuffer.  Returns immediately; no further AK8000
+    // processing happens this frame.
+    if (cp->rainbow_mode) {
+        int data_end = v->vid_frame_pos;
+        while (data_end > 40 && f[data_end - 1] == 0xFF) data_end--;
+        int bso  = cp->bs_offset;
+        if (bso >= data_end) return;
+
+        int w = cp->width  ? cp->width  : 192;
+        int h = cp->height ? cp->height : 144;
+        int ox = (SCREEN_W - w) / 2;
+        int oy = (SCREEN_H - h) / 2;
+        uint8_t *fb = v->framebuffer + (oy * SCREEN_W + ox) * 3;
+
+        rainbow_decode_frame(f + bso, data_end - bso,
+                             v->qtable, (int)qscale,
+                             fb, SCREEN_W * 3,
+                             w, h);
+
+        v->got_video_frame = true;
+        v->frame_count++;
+        return;
+    }
 
     // Dump qtable once
     static bool qtable_dumped = false;
