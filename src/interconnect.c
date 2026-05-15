@@ -43,16 +43,15 @@ void interconnect_sector_cb(void *ctx) {
 //  Install interrupt vectors + stubs
 // ─────────────────────────────────────────────────────────────
 
-// TLCS-870 stub: EI + RETI  (0xFB 0xED 0x4D)
-// EI re-enables interrupts, RETI returns from ISR and restores IFF
+// TLCS-870 stub: just RETI (0x04). RETI re-enables IRQs (sets EIR.0)
+// per MAME's TLCS-870 semantics — no separate EI needed.
 static const uint8_t tlcs_isr_stub[] = {
-    0xFB,       // EI
-    0xED, 0x4D, // RETI
+    0x04,       // RETI
 };
 
-// NEC 78K stub: RETI  (0x8A)
+// NEC 78K/II stub: RETI = 0x57
 static const uint8_t nec_isr_stub[] = {
-    0x9F,       // RETI (NEC 78K opcode)
+    0x57,
 };
 
 void interconnect_install(Playdia *p) {
@@ -73,23 +72,15 @@ void interconnect_install(Playdia *p) {
     p->mem[TVEC_CTRL+1] = (uint8_t)(TISRV_CTRL >> 8);
 
     // ── TLCS-870 ISR stubs in ROM ─────────────────────────────
-    // sector ISR: NOP (HLE hook fires), then EI + RETI
+    // Each ISR: NOP (HLE hook fires) + RETI (0x04 on TLCS-870)
     p->mem[TISRV_SECTOR]   = 0x00;   // NOP — HLE intercept point
-    p->mem[TISRV_SECTOR+1] = 0xFB;   // EI
-    p->mem[TISRV_SECTOR+2] = 0xED;   // RETI hi
-    p->mem[TISRV_SECTOR+3] = 0x4D;   // RETI lo
+    p->mem[TISRV_SECTOR+1] = 0x04;   // RETI (auto re-enables IRQs)
 
-    // vsync ISR
     p->mem[TISRV_VSYNC]    = 0x00;
-    p->mem[TISRV_VSYNC+1]  = 0xFB;
-    p->mem[TISRV_VSYNC+2]  = 0xED;
-    p->mem[TISRV_VSYNC+3]  = 0x4D;
+    p->mem[TISRV_VSYNC+1]  = 0x04;
 
-    // ctrl ISR
     p->mem[TISRV_CTRL]     = 0x00;
-    p->mem[TISRV_CTRL+1]   = 0xFB;
-    p->mem[TISRV_CTRL+2]   = 0xED;
-    p->mem[TISRV_CTRL+3]   = 0x4D;
+    p->mem[TISRV_CTRL+1]   = 0x04;
 
     // ── Add EI to TLCS-870 boot ROM — right before JP 0x2000 ──
     // Boot ROM ends with: CALL 0x0090 / JP 0x2000
@@ -111,12 +102,12 @@ void interconnect_install(Playdia *p) {
     p->io_mem[NVEC_VSYNC]    = (uint8_t)(NISRV_VSYNC & 0xFF);
     p->io_mem[NVEC_VSYNC+1]  = (uint8_t)(NISRV_VSYNC >> 8);
 
-    // ── NEC ISR stubs (HLE hook + RETI) ──────────────────────
+    // ── NEC ISR stubs (HLE hook + RETI)  78K/II RETI = 0x57 ────
     p->io_mem[NISRV_SECTOR]   = 0x00;  // NOP — HLE intercept
-    p->io_mem[NISRV_SECTOR+1] = 0x9F;  // RETI (NEC 78K opcode = 0x9F)
+    p->io_mem[NISRV_SECTOR+1] = 0x57;
 
     p->io_mem[NISRV_VSYNC]    = 0x00;
-    p->io_mem[NISRV_VSYNC+1]  = 0x9F;  // RETI
+    p->io_mem[NISRV_VSYNC+1]  = 0x57;
 
     // ── Wire CDROM IRQ callback ───────────────────────────────
     p->cdrom.irq_cb  = interconnect_sector_cb;

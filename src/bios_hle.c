@@ -24,49 +24,47 @@ static inline uint16_t pop16(Playdia *p) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Synthetic TLCS-870 ROM  (Z80-compatible opcodes)
+//  Synthetic TLCS-870 boot ROM (real TLCS-870 opcodes)
 //
-//  Written as raw bytes so no assembler is needed.
+//  All encodings cross-checked against MAME's TLCS-870 disassembler.
+//  Reg indices: A=0 W=1 C=2 B=3 E=4 D=5 L=6 H=7.
+//  Pair indices (LD rr,mn): WA=0 BC=1 DE=2 HL=3 → opcode 0x14+rr.
 //  Layout documented in bios_hle.h.
 // ─────────────────────────────────────────────────────────────
 static const uint8_t tlcs_rom[] = {
     // ── 0x0000: Reset entry ──────────────────────────────────
-    // LD SP, 0x5EFE
-    0x31, 0xFE, 0x5E,
-    // XOR A
-    0xAF,
-    // LD HL, 0x2000
-    0x21, 0x00, 0x20,
-    // LD BC, 0x3F00  (16128 iterations — clears 0x2000-0x5EFF)
-    0x01, 0x00, 0x3F,
-    // .clear_loop: (addr 0x000A)
-    // LD (HL), A
-    0x77,
-    // INC HL
-    0x23,
-    // DEC BC
-    0x0B,
-    // LD A, B
-    0x78,
-    // OR C
-    0xB1,
-    // JP NZ, 0x000A
-    0xC2, 0x0A, 0x00,
-    // CALL 0x0080   (HLE_INIT_HW)
-    0xCD, 0x80, 0x00,
-    // CALL 0x0090   (HLE_BOOT)
-    0xCD, 0x90, 0x00,
-    // JP 0x2000
-    0xC3, 0x00, 0x20,
+    // LD SP, 0x5EFE       (0xFA lo hi)
+    0xFA, 0xFE, 0x5E,
+    // LD HL, 0x2000       (0x17 = LD rr,mn with rr=3 (HL))
+    0x17, 0x00, 0x20,
+    // LD BC, 0x3F00       (0x15 = LD rr,mn with rr=1 (BC))
+    0x15, 0x00, 0x3F,
+    // LD A, #0            (0x30 = LD r,n with r=0 (A))
+    0x30, 0x00,
+    // .clear_loop:        (addr 0x000B)
+    // LD (HL), A          (0x2B)
+    0x2B,
+    // INC HL              (0x13 = INC rr with rr=3 (HL))
+    0x13,
+    // DEC BC              (0x19 = DEC rr with rr=1 (BC); sets ZF on rr==0)
+    0x19,
+    // JR NZ, -5           (0xD1 = JR cc with cc=1 (NE/NZ); disp 0xFB = -5)
+    0xD1, 0xFB,
+    // CALL 0x0080  (HLE_INIT_HW)   (0xFC lo hi)
+    0xFC, 0x80, 0x00,
+    // CALL 0x0090  (HLE_BOOT)
+    0xFC, 0x90, 0x00,
+    // JP 0x2000           (0xFE lo hi)
+    0xFE, 0x00, 0x20,
 
     // ── Padding to 0x0080 ────────────────────────────────────
-    // (ROM bytes 0x001E..0x007F are NOPs)
+    // (ROM bytes 0x0019..0x007F are NOPs)
 };
 
-// Hook stubs: each is NOP (0x00) + RET (0xC9).
+// Hook stubs: each is NOP (0x00) + RET (0x05).
 // The NOP is the intercept point — C code fires when PC == stub.
 // After C work, PC advances to the RET which pops the return addr.
-#define STUB { 0x00, 0xC9 }
+#define STUB { 0x00, 0x05 }
 static const uint8_t stub_initHW [2] = STUB;  // 0x0080
 static const uint8_t stub_boot   [2] = STUB;  // 0x0090
 static const uint8_t stub_rdSect [2] = STUB;  // 0x00A0
@@ -74,17 +72,13 @@ static const uint8_t stub_vsync  [2] = STUB;  // 0x00B0
 static const uint8_t stub_ctrl   [2] = STUB;  // 0x00C0
 
 // ─────────────────────────────────────────────────────────────
-//  Synthetic NEC 78K ROM
+//  Synthetic NEC 78K/II ROM
 //
-//  NEC 78K/0 opcodes used:
-//   MOV  A, sfr    = 0xF2, sfr_addr
-//   MOV  sfr, A    = 0xF0, sfr_addr
-//   CMP  A, #n     = 0xCE, n        (compare A with imm)
-//   BZ   rel       = 0xAD, rel      (branch if zero)
-//   BNZ  rel       = 0xAC, rel      (branch if not zero)
-//   BR   rel       = 0xFC, rel      (unconditional branch)
-//   HALT           = 0xFF
-//   NOP            = 0x00
+//  Real 78K/II opcodes (cross-checked against MAME's upd78k2d):
+//   NOP         = 0x00
+//   BR $rel8    = 0x14 disp
+//   HALT        triggered via MOV STBC,#imm (0x09 0xC0 ~imm imm)
+//                with imm bit 0 = HALT, bit 1 = STOP
 //
 //  Reset vector: mem[0x0000-0x0001] = 0x0100 (LE)
 //  Code at 0x0100: command poll loop
@@ -96,15 +90,14 @@ static const uint8_t nec_rom[] = {
 };
 
 // NEC command loop code at 0x0100
-// This is a polling loop — the real chip uses interrupts but
-// for HLE polling is fine (bios_hle_hook_nec does the work in C).
-// We just need valid opcodes that keep the CPU busy without crashing.
+// Polling loop — bios_hle_hook_nec does the work in C.  The CPU
+// just needs valid opcodes that loop indefinitely.
 static const uint8_t nec_loop[] = {
     // 0x0100:
     0x00,         // NOP
     0x00,         // NOP
     0x00,         // NOP
-    0xFA, 0xFB,   // BR $-5  (loop back to 0x0100; 0xFA=BR rel8, rel=-5)
+    0x14, 0xFB,   // BR $-5  (back to 0x0100; 0x14=BR rel8, disp=-5)
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -253,10 +246,10 @@ static void hle_boot(Playdia *p) {
         // This keeps the CPU busy while AK8000 handles video/audio
         uint16_t stub_addr = GAME_LOAD_ADDR + 0x1000; // 0x3000
         uint8_t *s = p->mem + stub_addr;
-        // .loop:
-        *s++ = 0xCD; *s++ = HLE_ADDR_VSYNC & 0xFF; *s++ = HLE_ADDR_VSYNC >> 8;  // CALL VSYNC
-        *s++ = 0xCD; *s++ = HLE_ADDR_CTRL  & 0xFF; *s++ = HLE_ADDR_CTRL  >> 8;  // CALL CTRL
-        *s++ = 0xC3; *s++ = stub_addr & 0xFF; *s++ = stub_addr >> 8;             // JP .loop
+        // .loop:   (TLCS-870 CALL mn = 0xFC, JP mn = 0xFE)
+        *s++ = 0xFC; *s++ = HLE_ADDR_VSYNC & 0xFF; *s++ = HLE_ADDR_VSYNC >> 8;  // CALL VSYNC
+        *s++ = 0xFC; *s++ = HLE_ADDR_CTRL  & 0xFF; *s++ = HLE_ADDR_CTRL  >> 8;  // CALL CTRL
+        *s++ = 0xFE; *s++ = stub_addr & 0xFF; *s++ = stub_addr >> 8;            // JP .loop
 
         // Redirect execution to our stub instead of raw GLB data
         p->cpu.PC = stub_addr;
@@ -330,12 +323,12 @@ static void hle_boot(Playdia *p) {
         p->cdrom.streaming = true;
         p->cdrom.stream_end = 0; // unlimited
 
-        // Install FMV playback loop stub
+        // Install FMV playback loop stub (TLCS-870 CALL=0xFC, JP=0xFE)
         uint16_t stub_addr = GAME_LOAD_ADDR + 0x1000; // 0x3000
         uint8_t *s = p->mem + stub_addr;
-        *s++ = 0xCD; *s++ = HLE_ADDR_VSYNC & 0xFF; *s++ = HLE_ADDR_VSYNC >> 8;
-        *s++ = 0xCD; *s++ = HLE_ADDR_CTRL  & 0xFF; *s++ = HLE_ADDR_CTRL  >> 8;
-        *s++ = 0xC3; *s++ = stub_addr & 0xFF; *s++ = stub_addr >> 8;
+        *s++ = 0xFC; *s++ = HLE_ADDR_VSYNC & 0xFF; *s++ = HLE_ADDR_VSYNC >> 8;
+        *s++ = 0xFC; *s++ = HLE_ADDR_CTRL  & 0xFF; *s++ = HLE_ADDR_CTRL  >> 8;
+        *s++ = 0xFE; *s++ = stub_addr & 0xFF; *s++ = stub_addr >> 8;
 
         p->cpu.PC = stub_addr;
         printf("[BIOS HLE] FMV playback loop at 0x%04X\n", stub_addr);

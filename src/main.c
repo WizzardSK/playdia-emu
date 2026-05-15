@@ -21,7 +21,7 @@ static void print_banner(void) {
     printf("║   Playdia Emulator  v0.2                         ║\n");
     printf("║   Bandai Playdia Quick Interactive System (1994) ║\n");
     printf("║   Main: Toshiba TLCS-870 @ 8MHz                  ║\n");
-    printf("║   I/O:  NEC µPD78214 (78K/0) @ 12MHz             ║\n");
+    printf("║   I/O:  NEC µPD78214 (78K/II) @ 12MHz            ║\n");
     printf("╚══════════════════════════════════════════════════╝\n\n");
 }
 
