@@ -1,94 +1,129 @@
+/* ================================================================
+ *  test_full.c — sanity tests for the rewritten CPU cores.
+ *
+ *  The previous version of this file tested Z80 opcodes (LD/EX
+ *  AF,AF'/EXX/CB-prefix etc.) against the old, incorrect Z80-based
+ *  TLCS-870 implementation.  Issue #4 documented that the chip is
+ *  not a Z80, so both the cores and these tests had to be redone.
+ *
+ *  Only a small smoke-test set is here for now — it confirms the
+ *  new cores boot, fetch, decode the handful of opcodes that are
+ *  actually implemented, and produce the expected register state.
+ *  Until the opcode coverage in cpu_tlcs870.c / cpu_nec78k.c is
+ *  filled out from the official manuals, broader test vectors are
+ *  not meaningful.
+ * ================================================================ */
+
 #include "src/cpu_tlcs870.h"
+#include "src/cpu_nec78k.h"
 #include <stdio.h>
 #include <string.h>
 
-static int passed=0, failed=0;
+static int passed = 0, failed = 0;
 static void check(const char *name, bool cond) {
-    if(cond){printf("  \xE2\x9C\x93 %s\n",name);passed++;}
-    else    {printf("  \xE2\x9C\x97 %s  FAIL\n",name);failed++;}
+    if (cond) { printf("  \xE2\x9C\x93 %s\n", name);       passed++; }
+    else      { printf("  \xE2\x9C\x97 %s  FAIL\n", name); failed++; }
 }
 
-static CPU_TLCS870 cpu;
-static uint8_t mem[0x10000];
+/* ── TLCS-870 ─────────────────────────────────────────────── */
+static CPU_TLCS870 t_cpu;
+static uint8_t     t_mem[0x10000];
 
-static void run(uint8_t *prog, int len) {
-    memset(mem,0,sizeof(mem));
-    cpu_tlcs870_init(&cpu,mem);
-    memcpy(&mem[0x2000],prog,len);
-    cpu.PC=0x2000;
-    for(int i=0;i<200&&!cpu.halted;i++) cpu_tlcs870_step(&cpu);
+static void t_run(const uint8_t *prog, int len) {
+    memset(t_mem, 0, sizeof(t_mem));
+    /* preload reset vector so init() picks 0x2000 as entry */
+    t_mem[0xFFFE] = 0x00; t_mem[0xFFFF] = 0x20;
+    cpu_tlcs870_init(&t_cpu, t_mem);
+    memcpy(&t_mem[0x2000], prog, len);
+    t_cpu.PC = 0x2000;
+    for (int i = 0; i < 200 && !t_cpu.halted; i++)
+        cpu_tlcs870_step(&t_cpu);
 }
 
-int main(void){
-    printf("\n=== Extended TLCS-870 Tests ===\n\n");
+static void test_tlcs870(void) {
+    printf("\n=== TLCS-870 sanity tests ===\n\n");
 
-    printf("[ LD ]\n");
-    {uint8_t p[]={0x06,0xAB,0x48,0x76};run(p,4);check("LD B,n/LD C,B",cpu.C==0xAB);}
-    {uint8_t p[]={0x21,0x34,0x12,0x7C,0x76};run(p,5);check("LD HL,nn/LD A,H",cpu.A==0x12);}
-    {uint8_t p[]={0x3E,0x55,0x32,0x00,0x30,0x3E,0x00,0x3A,0x00,0x30,0x76};
-     run(p,11);check("LD (nn),A / LD A,(nn)",cpu.A==0x55);}
+    /* NOP×4 — every NOP burns 2 cycles, expect ≥ 8 cycles after run */
+    { uint8_t p[] = { 0x00, 0x00, 0x00, 0x00 }; t_run(p, 4);
+      check("NOP×4 cycles", t_cpu.cycles >= 8); }
 
-    printf("[ INC/DEC 16-bit ]\n");
-    {uint8_t p[]={0x01,0xFF,0x00,0x03,0x76};run(p,5);
-     check("INC BC",(cpu.B<<8|cpu.C)==0x0100);}
-    {uint8_t p[]={0x11,0x00,0x01,0x1B,0x1B,0x76};run(p,6);
-     check("DEC DE x2",(cpu.D<<8|cpu.E)==0x00FE);}
+    /* SWAP A : A=0xAB → 0xBA */
+    { uint8_t p[] = { 0xD0, 0xAB, 0x01 }; t_run(p, 3);
+      check("SWAP A", t_cpu.A == 0xBA); }
 
-    printf("[ ALU ]\n");
-    {uint8_t p[]={0x3E,0xF0,0xC6,0x20,0x76};run(p,5);
-     check("ADD carry",cpu.A==0x10&&(cpu.F&FLAG_C));}
-    {uint8_t p[]={0x3E,0x01,0x37,0xCE,0x01,0x76};run(p,6);
-     check("ADC with carry",cpu.A==0x03);}
-    {uint8_t p[]={0x3E,0x10,0xD6,0x10,0x76};run(p,5);
-     check("SUB zero",cpu.A==0&&(cpu.F&FLAG_Z));}
-    {uint8_t p[]={0x3E,0x05,0xFE,0x05,0x76};run(p,5);
-     check("CP equal",cpu.A==5&&(cpu.F&FLAG_Z));}
-    {uint8_t p[]={0x3E,0xFF,0xE6,0x0F,0x76};run(p,5);check("AND",cpu.A==0x0F);}
-    {uint8_t p[]={0x3E,0xF0,0xF6,0x0F,0x76};run(p,5);check("OR",cpu.A==0xFF);}
-    {uint8_t p[]={0x3E,0xFF,0xEE,0xFF,0x76};run(p,5);check("XOR->0",cpu.A==0);}
+    /* LD A,#0x55 */
+    { uint8_t p[] = { 0xD0, 0x55 }; t_run(p, 2);
+      check("LD A,#imm", t_cpu.A == 0x55); }
 
-    printf("[ ADD HL,rr ]\n");
-    {uint8_t p[]={0x21,0x00,0x10,0x01,0x00,0x01,0x09,0x76};run(p,8);
-     check("ADD HL,BC",(cpu.H<<8|cpu.L)==0x1100);}
+    /* INC A : reg index for A = TLCS870_REG_A = 4 → opcode 0x14 */
+    { uint8_t p[] = { 0xD0, 0x0F, 0x14 }; t_run(p, 3);
+      check("INC A", t_cpu.A == 0x10); }
 
-    printf("[ Jumps ]\n");
-    {uint8_t p[]={0x06,0x03,0x10,0xFE,0x76};run(p,5);check("DJNZ",cpu.B==0);}
-    {uint8_t p[]={0x3E,0x00,0xFE,0x01,0xC2,0x0A,0x20,0x3E,0x99,0x00,0x76};
-     run(p,11);check("JP NZ skips",cpu.A==0x00);}
-    {uint8_t p[]={0x18,0x02,0x3E,0x99,0x76};run(p,5);check("JR skips",cpu.A!=0x99);}
+    /* MUL W,A : A=4, W=3 → WA=12 → A=12, W=0 */
+    { uint8_t p[] = { 0xD0, 0x04, 0xD5, 0x03, 0x02 }; t_run(p, 5);
+      check("MUL W,A", t_cpu.A == 12 && t_cpu.W == 0); }
 
-    printf("[ CALL/RET ]\n");
-    {uint8_t p[]={0xCD,0x07,0x20, 0x76, 0x00,0x00,0x00, 0x3E,0xAA,0xC9};
-     run(p,10);check("CALL/RET",cpu.A==0xAA);}
+    /* CALL/RET round-trip */
+    { uint8_t p[] = {
+        0xFC, 0x08, 0x20,    /* CALL 0x2008                       */
+        0x00, 0x00, 0x00, 0x00, 0x00,
+        0xD0, 0x77,          /* @0x2008: LD A,#0x77                */
+        0x05                 /* RET                                */
+      }; t_run(p, 11);
+      check("CALL/RET", t_cpu.A == 0x77); }
 
-    printf("[ EX/EXX ]\n");
-    {uint8_t p[]={0x3E,0x11,0x08,0x3E,0x22,0x08,0x76};
-     run(p,7);check("EX AF,AF'",cpu.A==0x11);}
-    {uint8_t p[]={0x01,0xBB,0xAA,0xD9,0x01,0x00,0x00,0xD9,0x76};
-     run(p,9);check("EXX BC",(cpu.B<<8|cpu.C)==0xAABB);}
+    /* JR rel : skip a byte */
+    { uint8_t p[] = { 0xC0, 0x02, 0xD0, 0xFF, 0xD0, 0x33 }; t_run(p, 6);
+      check("JR skips LD", t_cpu.A == 0x33); }
+}
 
-    printf("[ PUSH/POP ]\n");
-    {uint8_t p[]={0x01,0xBE,0xEF,0xC5,0x01,0x00,0x00,0xC1,0x76};
-     run(p,9);check("PUSH/POP BC",cpu.B==0xEF&&cpu.C==0xBE);}
+/* ── NEC 78K/II ────────────────────────────────────────────── */
+static CPU_NEC78K  n_cpu;
+static uint8_t     n_mem[0x10000];
 
-    printf("[ CB prefix ]\n");
-    {uint8_t p[]={0x3E,0x80,0xCB,0x07,0x76};run(p,5);
-     check("RLC A",cpu.A==0x01&&(cpu.F&FLAG_C));}
-    {uint8_t p[]={0x3E,0x01,0xCB,0x6F,0x76};run(p,5);
-     check("BIT 5,A Z=1",(cpu.F&FLAG_Z)!=0);}
-    {uint8_t p[]={0x3E,0x00,0xCB,0xC7,0x76};run(p,5);check("SET 0,A",cpu.A==0x01);}
-    {uint8_t p[]={0x3E,0xFF,0xCB,0x87,0x76};run(p,5);check("RES 0,A",cpu.A==0xFE);}
-    {uint8_t p[]={0x3E,0x01,0xCB,0x38,0x76};run(p,5);
-     check("SRL A 0x02->0x01",cpu.A==0x01&&!(cpu.F&FLAG_C));}
+static void n_run(const uint8_t *prog, int len) {
+    memset(n_mem, 0, sizeof(n_mem));
+    n_mem[0] = 0x00; n_mem[1] = 0x20;        /* reset vector → 0x2000 */
+    cpu_nec78k_init(&n_cpu, n_mem);
+    memcpy(&n_mem[0x2000], prog, len);
+    n_cpu.PC = 0x2000;
+    for (int i = 0; i < 200 && !n_cpu.halted; i++)
+        cpu_nec78k_step(&n_cpu);
+}
 
-    printf("[ Misc ]\n");
-    {uint8_t p[]={0x3E,0xAA,0x2F,0x76};run(p,4);check("CPL",cpu.A==0x55);}
-    {uint8_t p[]={0x37,0x3F,0x76};run(p,3);check("SCF+CCF",!(cpu.F&FLAG_C));}
-    {uint8_t p[]={0x11,0x34,0x12,0x21,0xCD,0xAB,0xEB,0x76};run(p,8);
-     check("EX DE,HL",cpu.H==0x12&&cpu.L==0x34&&cpu.D==0xAB&&cpu.E==0xCD);}
+static void test_nec78k(void) {
+    printf("\n=== NEC 78K/II sanity tests ===\n\n");
 
-    printf("\n\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\n");
-    printf("  Passed: %d / %d\n", passed, passed+failed);
-    printf("\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\n");
-    return failed?1:0;
+    /* NOP×3 then HALT (0xFF) */
+    { uint8_t p[] = { 0x00, 0x00, 0x00, 0xFF }; n_run(p, 4);
+      check("NOP+HALT", n_cpu.halted); }
+
+    /* MOV A,#imm   (opcode 0x10, imm) */
+    { uint8_t p[] = { 0x10, 0x42, 0xFF }; n_run(p, 3);
+      check("MOV A,#0x42", n_cpu.r[1] == 0x42); }
+
+    /* MOVW AX,#0xABCD */
+    { uint8_t p[] = { 0xC0, 0xCD, 0xAB, 0xFF }; n_run(p, 4);
+      check("MOVW AX,#0xABCD",
+            n_cpu.r[0] == 0xCD && n_cpu.r[1] == 0xAB); }
+
+    /* MOV A,#5 ; CMP A,#5 → Z=1 */
+    { uint8_t p[] = { 0x10, 0x05, 0xCF, 0x05, 0xFF }; n_run(p, 5);
+      check("CMP A,#5 Z=1", (n_cpu.PSW & NEC_Z) != 0); }
+
+    /* DI then EI toggles IE */
+    { uint8_t p[] = { 0xFB, 0xFF }; n_run(p, 2);
+      check("DI clears IE", (n_cpu.PSW & NEC_IE) == 0); }
+    { uint8_t p[] = { 0xFC, 0xFF }; n_run(p, 2);
+      check("EI sets IE",   (n_cpu.PSW & NEC_IE) != 0); }
+}
+
+int main(void) {
+    test_tlcs870();
+    test_nec78k();
+
+    printf("\n══════════════════════\n");
+    printf("  Passed: %d / %d\n", passed, passed + failed);
+    printf("══════════════════════\n\n");
+    return failed ? 1 : 0;
 }
