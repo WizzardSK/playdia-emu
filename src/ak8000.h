@@ -111,6 +111,7 @@ typedef struct AK8000 {
     uint32_t seek_target;           // LBA to seek to (0 = none pending)
     uint32_t cmd_lba;               // LBA where last F2 command was found
     bool     is_loop;               // true if F2 40 is a backward jump (loop)
+    bool     choice_override;       // F2 64: a held button picks its own slot
 } AK8000;
 
 // ── API ───────────────────────────────────────────────────────

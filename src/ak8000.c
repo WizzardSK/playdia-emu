@@ -509,6 +509,23 @@ static void ak8000_parse_f2_command(AK8000 *v, const uint8_t *payload,
         printf(")\n");
         break;
 
+    case 0x64:
+        // Timed jump with a player override. The low nibble 4 marks the
+        // commands that read the controller (40/44, 60/64), and the seven
+        // slots here are not identical the way a plain jump's are: on Aqua
+        // Adventure the first six continue to the next sector and B goes
+        // back. So it advances like F2 60, but a button held at that moment
+        // takes its own slot. Inferred from the command layout, not documented.
+        v->interactive_pending = true;
+        v->waiting_for_input = false;
+        v->seek_target = v->button_dest[0];
+        v->choice_override = true;
+        printf("[AK8000] F2 64 TIMED CHOICE @ LBA %u: ", current_lba);
+        for (int i = 0; i < 7; i++)
+            printf("B%d=%u ", i + 1, v->button_dest[i]);
+        printf("\n");
+        break;
+
     case 0x60:
         // Timed jump / animation control
         v->seek_target = v->button_dest[0];

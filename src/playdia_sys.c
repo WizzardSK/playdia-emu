@@ -138,6 +138,19 @@ void playdia_mem_write(Playdia *p, uint16_t addr, uint8_t val) {
 //    B4 = Left      B5 = Right
 //    B6 = A         B7 = B
 // ─────────────────────────────────────────────────────────────
+// Playdia's seven button slots, in the order the F2 destination table uses
+// them: B1 = default/Start, then Up, Down, Left, Right, A, B.
+static int controller_choice(uint8_t btn) {
+    if (btn & BTN_UP)    return 1;
+    if (btn & BTN_DOWN)  return 2;
+    if (btn & BTN_LEFT)  return 3;
+    if (btn & BTN_RIGHT) return 4;
+    if (btn & BTN_A)     return 5;
+    if (btn & BTN_B)     return 6;
+    if (btn & BTN_START) return 0;
+    return -1;
+}
+
 static void playdia_handle_interactive(Playdia *p) {
     AK8000 *v = &p->video;
 
@@ -164,18 +177,25 @@ static void playdia_handle_interactive(Playdia *p) {
         return;
     }
 
+    // ── F2 64: seeks by itself, but a button held right then takes its
+    //    own slot. Only the live controller counts, never the latch: the
+    //    default slot continues to the next sector, so a stale press must
+    //    not silently divert the stream.
+    if (v->choice_override) {
+        v->choice_override = false;
+        int slot = controller_choice(p->controller);
+        if (slot >= 0 && v->button_dest[slot] > 0) {
+            v->seek_target = v->button_dest[slot];
+            printf("[Interactive] F2 64 button %d → LBA %u\n",
+                   slot + 1, v->seek_target);
+        }
+    }
+
     // ── Forward F2 40/60/90/A0: auto-seek, no input needed ──
     if (!v->waiting_for_input) return;
 
     // ── Waiting for player input (F2 44, F2 50) ─────────────
-    int choice = -1;
-    if (btn & BTN_UP)        choice = 1;  // B2
-    else if (btn & BTN_DOWN) choice = 2;  // B3
-    else if (btn & BTN_LEFT) choice = 3;  // B4
-    else if (btn & BTN_RIGHT)choice = 4;  // B5
-    else if (btn & BTN_A)    choice = 5;  // B6
-    else if (btn & BTN_B)    choice = 6;  // B7
-    else if (btn & BTN_START)choice = 0;  // B1 (default)
+    int choice = controller_choice(btn);
 
     if (choice >= 0) {
         v->seek_target = v->button_dest[choice];
