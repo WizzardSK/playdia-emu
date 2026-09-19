@@ -22,7 +22,7 @@ Dependencies for the standalone: SDL2, libavcodec, libavutil, libswscale. Zips a
 The libretro core needs none of those - only a C compiler and libm. It is built from `Makefile.libretro`, which carries the platform handling:
 
 ```bash
-make -f Makefile.libretro platform=unix        # also osx, ios, android, emscripten, libnx, win
+make -f Makefile.libretro platform=unix        # also osx, ios, android, emscripten, win
 ```
 
 ## Running
@@ -85,20 +85,21 @@ The AK8000 uses a proprietary DCT-based video codec. No documentation exists any
 
 ## Disc Structure
 - **F1 sectors**: Video data (marker byte `0xF1`, 2047 bytes payload)
-- **F2 sectors**: End-of-frame marker (triggers decode of assembled frame)
-- **F3 sectors**: Scene marker (reset frame accumulator)
-- Each video packet: **6–13 F1 sectors** (typically 8 = 16376 bytes, containing 3 frames)
+- **F2 sectors**: End of picture. The sector carries the tail of the picture from byte `0x23`, then the assembled packet is decoded
+- **F3 sectors**: Scene marker (resets the accumulator). Filler - two bytes then `0xFF` padding - is not a scene change and must not reset it
+- Each video packet: **6–13 F1 sectors**, holding **one** picture
 
-## Frame Header (40 bytes)
+## Picture Header (36 bytes)
 ```
 Offset  Content
-[0-2]   00 80 04          — frame marker
-[3]     QS                — quantization scale (observed: 4–40)
-[4-19]  16-byte qtable    — quantization table (constant across all games tested)
+[0-2]   00 80 04          — 19-bit picture marker (0x400), then picture type
+                            and quantizer shift
+[3]     factor            — quantizer scale (observed: 4–40)
+[4-19]  16-byte qtable    — luma quantization table
 [20-35] 16-byte qtable    — chroma table (equal to the luma one on every game tested)
-[36-38] 00 80 24          — second marker
-[39]    TYPE              — purpose unknown (common values: 0x00, 0x06, 0x07)
 ```
+The entropy-coded rows start at bit `36 × 8`; what earlier looked like a second
+marker at [36-38] is the first row marker of the picture.
 
 The qtable is always `0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14` — likely hardcoded in the AK8000 chip.
 
@@ -112,80 +113,23 @@ The qtable is always `0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14` — likel
   luma block of the next macroblock; chroma predicts per component, reset each row
 - **IDCT**: integer 4×4 transform, pixel = IDCT(coeff × qtable × factor) + 128
 
-## VLC Table (Modified MPEG-1 Luminance DC)
+## Coefficient VLC
 
-Used for **both DC and AC values**. Based on MPEG-1 luminance DC VLC but with sizes 7/8 **compressed to both 6 bits**:
+Run/level codes, 63 of them, from 2 to 13 bits, each followed by a sign bit.
+Two codes stand outside the table: `01` ends the block, and `001000` is the
+escape, carrying a 4-bit run and a 10-bit signed level. Coefficients are placed
+through the scan `0 1 4 8 5 2 3 6 9 12 13 10 7 11 14 15`, and a run that pushes
+past the sixteenth coefficient is an error rather than something to clamp.
 
-```
-Size  Code bits      Note
-0     100            3 bits — value 0
-1     00             2 bits
-2     01             2 bits
-3     101            3 bits
-4     110            3 bits
-5     1110           4 bits
-6     11110          5 bits
-7     111110         6 bits — standard MPEG-1
-8     111111         6 bits — COMPRESSED (standard would be 1111110 = 7 bits)
-```
+The table is in `src/ak8000_pd.c`; it is decoded through an 8192-entry lookup
+built at first use.
 
-**Key difference from standard MPEG-1**: sizes 7 and 8 are both 6-bit codes, differentiated by the last bit (0=size 7, 1=size 8). This saves 1 bit per size-8 occurrence.
+## Dequantization
 
-After reading the size code, `size` additional bits encode the magnitude (MPEG-1 sign convention).
-
-### Magnitude Encoding
-Standard MPEG-1 sign convention: if value < 2^(size-1), subtract 2^size - 1.
-**Note**: AC values show negative bias (mean=-1.73), suggesting sign convention may need inversion.
-
-## Multi-Frame Packing
-
-Each packet contains **2–4 independent frames** in a continuous bitstream (DC+AC per frame, packed back-to-back with no byte alignment). Frame count depends on content complexity and QS:
-
-| F1 sectors | Packet size | Frames | Frequency |
-|------------|-------------|--------|-----------|
-| 8 | 16376 bytes | 3 | 90.8% |
-| 7 | 14329 bytes | 3 | 6.0% |
-| 13 | 26611 bytes | 3 | 2.5% |
-| 6 | 12282 bytes | 3 | 0.6% |
-
-Bitstream analysis confirms: each frame's DC section (~3800 bits) + AC section (~29000 bits) consumes ~33% of the packet. The last frame may be slightly truncated when data runs out.
-
-## Bitstream Structure — SOLVED (2026-09-19)
-
-The syntax was recovered by [PlaydiaEmu](https://github.com/AloysHF/PlaydiaEmu) and
-is implemented here in `src/ak8000_pd.c`. `tools/pd_vcodec_test.c` decodes every
-picture on a disc and matches PlaydiaEmu's own `playdia-frame` byte for byte.
-
-The sections below are the record of the search that did **not** find it, kept
-because the negative results are still worth something.
-
-### The dead end (2026-03-15)
-
-**The video bitstream encoding remained unsolved for six months.** After extensive analysis including 600K+ brute-force VLC permutation tests, 225K structural parameter combinations, and comparison with multiple game-era codecs, no decode model produces recognizable images.
-
-### What IS known
-- Bitstream starts somewhere around bytes 40-44 of the packet
-- Each frame consumes approximately **28-33%** of the packet bitstream → 3 frames per packet
-- The VLC produces values with a **correct brightness distribution** (QQ-correlation 0.96 with reference images)
-- AC sections within blocks show **real DCT basis function patterns**
-- Bytes 40-42 correlate with global frame color (Y, Cb, Cr)
-- The MPEG-1 luminance DC VLC decodes without errors (but this is trivially true for ANY bitstream since it's a complete prefix code)
-
-### What is NOT known
-- The correct VLC table (MPEG-1 DC VLC is assumed but NOT confirmed)
-- Whether DC and AC use the **same or different VLC tables** (PC-FX uses different tables)
-- The DC prediction model (DPCM, offset, 2D predictor, or other)
-- The AC coding model (run-level, sequential, fixed count)
-- The spatial block ordering (scan order)
-- The dequantization formula
-- Whether level shift (+128) is applied
-
-## Dequantization — UNKNOWN
-
-The 16-byte quantization table and QS byte are present but their exact use is unknown. Possible models:
-- `coeff × qtable[pos]` (simple multiply, used by PC-FX)
-- `coeff × qtable[pos] × QS / N` (MPEG-1 style)
-- DC and AC may use different dequantization
+`coeff × qtable[i] × factor`, with the luma table for the four luma blocks and
+the chroma table for the other two, followed by the integer 4×4 inverse
+transform and `+128`. The trailer is at most 15 zero bits before byte-aligned
+`0xFF` fill - anything else there means the picture is not intact.
 
 ## XA ADPCM Audio
 
@@ -210,61 +154,12 @@ All games share identical qtable values and frame header format.
 
 4/5 games share identical Bandai logo intro. QS decreases over intro: 13→13→13→13→11→10→10→8→8→7 (quality ramp-up).
 
-## Reverse Engineering Methodology
+## What is still open
 
-### Exhaustive Search (2026-03-14 to 2026-03-15)
-
-Over 1 million decode configurations tested including:
-
-**VLC tables**: Standard MPEG-1 DC (sizes 0-16), modified size 7/8 (both 6-bit), 362K permutations of size assignments, H.261, MPEG-2, JPEG AC, Exp-Golomb, Rice coding
-
-**DC models**: DPCM (continuous, per-row reset, per-MB reset), DC offset (init+diff), absolute, 2D predictor (avg left+above), vertical DPCM, various init values (0, 128, byte[40])
-
-**AC models**: Sequential VLC 0=EOB, fixed count (7-63), 6-bit EOB + unary run + VLC level, combined run-level (|v|-1)/3, MPEG-1 B.14/B.15, no AC
-
-**Structural**: Resolutions 128-288 width, 4:2:0/4:2:2, MB orders (row/col/zigzag/boustro + flips), Y block orders (std/col/rev), bit orders (MSB/LSB), start bytes (36-48), bit offsets (0-7)
-
-**Other codecs**: PS1 MDEC, CD-i DYUV, Hadamard transform, DST, pixel DPCM, Cinepak-like VQ, 4-bit raw, 4×4 DCT sub-blocks
-
-**Correlation methods**: Raw Pearson, 1D detrended (row means), 2D detrended (row+col means), Spearman rank, QQ-plot, cross-game matching, shuffle tests
-
-### Key Findings
-
-1. **Format is 100% proprietary** — no MPEG-1 start codes, no MPEG-PS pack headers, ffprobe recognizes no standard codec or container
-2. **QIS boot logo appears on all 32 tested games** — Group A (12 games, Y_init=127) and Group B (16 games, Y_init=144) with identical bitstreams within each group
-3. **VLC value DISTRIBUTION matches reference** (QQ-correlation 0.96) but **spatial ordering does not** — the brightness values are correct but placed at wrong 2D positions
-4. **All high correlations proved to be DPCM drift artifacts** — cumulative sums always create gradients that spuriously match reference images (1D, 2D, diagonal variants)
-5. **VLC brute-force overfits** — different packets produce different "best" VLC tables, confirming the matches are statistical coincidences, not the real VLC
-6. **AC blocks show DCT basis patterns** — horizontal/vertical gradients within 8×8 blocks consistent with DCT transform
-
-### Comparison with PC-FX (similar era proprietary FMV)
-
-The PC-FX RAINBOW decoder (reversed by David Michel, implemented in Mednafen) uses:
-- **Different VLC tables for DC vs AC** and for **luma vs chroma**
-- DPCM DC prediction, run-level AC coding
-- Dequant: `coeff × qtable[pos]`
-- Y block order: TL, **BL**, TR, BR (not standard TL, TR, BL, BR)
-- Level shift +128
-
-The Playdia AK8000 likely uses a similar DCT+VLC architecture but with unknown custom tables.
-
-### What's Needed to Solve
-
-- **Hardware capture**: Record Playdia composite video output synchronized with disc sector reads to create ground-truth input/output pairs
-- **AK8000 die shot**: Decap the chip and analyze the decoder logic
-- **Japanese community contact**: Someone may have reversed this already (Twitter #レトロゲーム, #プレイディア)
-
-See git history for ~80 test tools in `tools/` and analysis scripts in `/tmp/pd_*.py`.
-
-## Open Questions
-
-1. **VLC table**: Is it MPEG-1 DC luminance, or a custom table? DC and AC may use **different tables** (as PC-FX does). The MPEG-1 DC VLC is a complete prefix code that decodes ANY bitstream without errors, so clean decoding proves nothing.
-2. **Spatial ordering**: The VLC produces correct VALUE distributions but incorrect spatial arrangement. The scan order, MB layout, and block-within-MB ordering are all unknown.
-3. **DC prediction**: DPCM, offset, 2D predictor? The prediction model determines spatial reconstruction.
-4. **Quantization table**: 16 entries could be 4×4 matrix or first 16 zigzag positions of 8×8. Formula unknown.
-5. **Resolution**: Likely 192×144 (4:3) but not confirmed.
-6. **Header bytes 40-43**: Byte 40-42 correlate with frame color (Y, Cb, Cr). Byte 43 and byte 39 purpose unknown.
-7. **Frame types**: Byte 39 values (0x00, 0x06, 0x07) may indicate I-frame vs P-frame.
+1. **Hardware pixel accuracy**: the decoder produces the right picture, but the rounding of the inverse transform and the exact YCbCr coefficients have not been checked against hardware output.
+2. **Eight pictures out of 39109** on Aqua Adventure fail entropy validation, in the same places PlaydiaEmu's own decoder fails. Whether the discs are like that or both decoders share a gap is unknown.
+3. **Picture type and quantizer shift**: the decoder only accepts type 1 with shift 0, which is all the tested discs carry. What else the fields can hold is unknown.
+4. **F2 commands `0x88` and `0xB0`** appear on discs and are not implemented; `0x64` is implemented from its layout rather than from documentation.
 
 ## Reference Images
 
@@ -337,3 +232,86 @@ Not yet implemented: the `&` (alternate-bank, prefix `0x01 0x05/0x06/0x09/0x0A/
 0x16/0x5x`) expansion-memory forms. The 1 MB physical space is paged via the
 external MM SFR at `0xFFC4` (host responsibility — the CPU core itself only
 sees the current 64 KB window).
+
+---
+
+## Bitstream Structure — SOLVED (2026-09-19)
+
+The syntax was recovered by [PlaydiaEmu](https://github.com/AloysHF/PlaydiaEmu) and
+is implemented here in `src/ak8000_pd.c`. `tools/pd_vcodec_test.c` decodes every
+picture on a disc and matches PlaydiaEmu's own `playdia-frame` byte for byte.
+
+Everything from here to the end of this file is the record of the search that
+did **not** find it, kept because the negative results are still worth
+something. It describes what was believed at the time, not how the decoder
+works now.
+
+### The dead end (2026-03-15)
+
+**The video bitstream encoding remained unsolved for six months.** After extensive analysis including 600K+ brute-force VLC permutation tests, 225K structural parameter combinations, and comparison with multiple game-era codecs, no decode model produces recognizable images.
+
+### What IS known
+- Bitstream starts somewhere around bytes 40-44 of the packet
+- Each frame consumes approximately **28-33%** of the packet bitstream → 3 frames per packet
+- The VLC produces values with a **correct brightness distribution** (QQ-correlation 0.96 with reference images)
+- AC sections within blocks show **real DCT basis function patterns**
+- Bytes 40-42 correlate with global frame color (Y, Cb, Cr)
+- The MPEG-1 luminance DC VLC decodes without errors (but this is trivially true for ANY bitstream since it's a complete prefix code)
+
+### What is NOT known
+- The correct VLC table (MPEG-1 DC VLC is assumed but NOT confirmed)
+- Whether DC and AC use the **same or different VLC tables** (PC-FX uses different tables)
+- The DC prediction model (DPCM, offset, 2D predictor, or other)
+- The AC coding model (run-level, sequential, fixed count)
+- The spatial block ordering (scan order)
+- The dequantization formula
+- Whether level shift (+128) is applied
+
+## Reverse Engineering Methodology
+
+### Exhaustive Search (2026-03-14 to 2026-03-15)
+
+Over 1 million decode configurations tested including:
+
+**VLC tables**: Standard MPEG-1 DC (sizes 0-16), modified size 7/8 (both 6-bit), 362K permutations of size assignments, H.261, MPEG-2, JPEG AC, Exp-Golomb, Rice coding
+
+**DC models**: DPCM (continuous, per-row reset, per-MB reset), DC offset (init+diff), absolute, 2D predictor (avg left+above), vertical DPCM, various init values (0, 128, byte[40])
+
+**AC models**: Sequential VLC 0=EOB, fixed count (7-63), 6-bit EOB + unary run + VLC level, combined run-level (|v|-1)/3, MPEG-1 B.14/B.15, no AC
+
+**Structural**: Resolutions 128-288 width, 4:2:0/4:2:2, MB orders (row/col/zigzag/boustro + flips), Y block orders (std/col/rev), bit orders (MSB/LSB), start bytes (36-48), bit offsets (0-7)
+
+**Other codecs**: PS1 MDEC, CD-i DYUV, Hadamard transform, DST, pixel DPCM, Cinepak-like VQ, 4-bit raw, 4×4 DCT sub-blocks
+
+**Correlation methods**: Raw Pearson, 1D detrended (row means), 2D detrended (row+col means), Spearman rank, QQ-plot, cross-game matching, shuffle tests
+
+### Key Findings
+
+1. **Format is 100% proprietary** — no MPEG-1 start codes, no MPEG-PS pack headers, ffprobe recognizes no standard codec or container
+2. **QIS boot logo appears on all 32 tested games** — Group A (12 games, Y_init=127) and Group B (16 games, Y_init=144) with identical bitstreams within each group
+3. **VLC value DISTRIBUTION matches reference** (QQ-correlation 0.96) but **spatial ordering does not** — the brightness values are correct but placed at wrong 2D positions
+4. **All high correlations proved to be DPCM drift artifacts** — cumulative sums always create gradients that spuriously match reference images (1D, 2D, diagonal variants)
+5. **VLC brute-force overfits** — different packets produce different "best" VLC tables, confirming the matches are statistical coincidences, not the real VLC
+6. **AC blocks show DCT basis patterns** — horizontal/vertical gradients within 8×8 blocks consistent with DCT transform
+
+### Comparison with PC-FX (similar era proprietary FMV)
+
+The PC-FX RAINBOW decoder (reversed by David Michel, implemented in Mednafen) uses:
+- **Different VLC tables for DC vs AC** and for **luma vs chroma**
+- DPCM DC prediction, run-level AC coding
+- Dequant: `coeff × qtable[pos]`
+- Y block order: TL, **BL**, TR, BR (not standard TL, TR, BL, BR)
+- Level shift +128
+
+The Playdia AK8000 likely uses a similar DCT+VLC architecture but with unknown custom tables.
+
+### What's Needed to Solve
+
+Nothing, as it turned out: the syntax came from PlaydiaEmu rather than from any
+of the approaches below. The list is kept as the record of what was tried.
+
+- **Hardware capture**: Record Playdia composite video output synchronized with disc sector reads to create ground-truth input/output pairs
+- **AK8000 die shot**: Decap the chip and analyze the decoder logic
+- **Japanese community contact**: Someone may have reversed this already (Twitter #レトロゲーム, #プレイディア)
+
+See git history for ~80 test tools in `tools/`.
