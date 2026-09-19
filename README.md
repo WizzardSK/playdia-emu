@@ -37,10 +37,10 @@ Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Ful
 | NEC 78K/II CPU | Substantial subset of the µPD78214GC ISA per the 78K/II manual (opcode encoding cross-checked against MAME's `upd78k2d` disassembler — MAME has no execution core). |
 | CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
 | BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
-| Video decode | **AK8000 proprietary DCT codec** — DC offset + fixed 10 AC per block, modified MPEG-1 VLC |
+| Video decode | **AK8000 proprietary DCT codec** — 4×4 blocks, run/level VLC, DC prediction per macroblock (`src/ak8000_pd.c`) |
 | Audio decode | **XA ADPCM** with resampling to 44100 Hz |
 | Interactive | **F2 commands** — jumps, choices (F2 44), loops, quiz, timeout |
-| Display | SDL2, 320×240, 192×144 video centered |
+| Display | SDL2, 320×240, 248×216 video centered |
 | Pipeline | 10 sectors/frame @ 30fps (~4× CD speed) |
 
 ### Interactive FMV Commands
@@ -79,7 +79,7 @@ Offset  Content
 [0-2]   00 80 04          — frame marker
 [3]     QS                — quantization scale (observed: 4–40)
 [4-19]  16-byte qtable    — quantization table (constant across all games tested)
-[20-35] 16-byte qtable    — identical copy
+[20-35] 16-byte qtable    — chroma table (equal to the luma one on every game tested)
 [36-38] 00 80 24          — second marker
 [39]    TYPE              — purpose unknown (common values: 0x00, 0x06, 0x07)
 ```
@@ -87,11 +87,14 @@ Offset  Content
 The qtable is always `0A 14 0E 0D 12 25 16 1C 0F 18 0F 12 12 1F 11 14` — likely hardcoded in the AK8000 chip.
 
 ## Image Format
-- **Resolution**: 192×144 pixels (4:3 aspect ratio)
+- **Resolution**: 248×216 pixels
 - **Color**: YCbCr 4:2:0 — 6 blocks per macroblock (4Y + Cb + Cr)
-- **Macroblocks**: 12×9 = 108 macroblocks, 648 blocks total
-- **Y sub-block order**: TL, TR, BL, BR within each 16×16 macroblock
-- **IDCT**: Standard orthonormal 8×8 DCT, pixel = IDCT(coeff), NO level shift
+- **Macroblocks**: 31×27 = 837 macroblocks, 5022 blocks total, 8×8 pixels each
+- **Blocks**: 4×4, not 8×8; each row of macroblocks opens with a 19-bit row marker
+- **Y sub-block order**: TL, TR, BL, BR within each 8×8 macroblock
+- **DC prediction**: the first luma block predicts the other three and the first
+  luma block of the next macroblock; chroma predicts per component, reset each row
+- **IDCT**: integer 4×4 transform, pixel = IDCT(coeff × qtable × factor) + 128
 
 ## VLC Table (Modified MPEG-1 Luminance DC)
 
@@ -131,9 +134,18 @@ Each packet contains **2–4 independent frames** in a continuous bitstream (DC+
 
 Bitstream analysis confirms: each frame's DC section (~3800 bits) + AC section (~29000 bits) consumes ~33% of the packet. The last frame may be slightly truncated when data runs out.
 
-## Bitstream Structure — UNSOLVED (2026-03-15)
+## Bitstream Structure — SOLVED (2026-09-19)
 
-**The video bitstream encoding remains unsolved.** After extensive analysis including 600K+ brute-force VLC permutation tests, 225K structural parameter combinations, and comparison with multiple game-era codecs, no decode model produces recognizable images.
+The syntax was recovered by [PlaydiaEmu](https://github.com/AloysHF/PlaydiaEmu) and
+is implemented here in `src/ak8000_pd.c`. `tools/pd_vcodec_test.c` decodes every
+picture on a disc and matches PlaydiaEmu's own `playdia-frame` byte for byte.
+
+The sections below are the record of the search that did **not** find it, kept
+because the negative results are still worth something.
+
+### The dead end (2026-03-15)
+
+**The video bitstream encoding remained unsolved for six months.** After extensive analysis including 600K+ brute-force VLC permutation tests, 225K structural parameter combinations, and comparison with multiple game-era codecs, no decode model produces recognizable images.
 
 ### What IS known
 - Bitstream starts somewhere around bytes 40-44 of the packet

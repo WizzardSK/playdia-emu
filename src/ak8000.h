@@ -8,12 +8,11 @@
 //  Asahi Kasei AK8000  —  Audio/Video Processor
 //
 //  The AK8000 uses a proprietary video codec (NOT standard MPEG-1).
-//  Video frames are assembled from 6-13 F1 sectors (12282-26611 bytes)
-//  with a 40-byte header and DCT-based compression.
-//  Most packets use 8 F1 sectors (16376 bytes) containing 3 frames.
+//  Pictures are assembled from 6-13 F1 sectors plus the tail of the
+//  F2 frame-end sector, and decoded in ak8000_pd.c.
 //
-//  Video: 256×144, 4:2:0, ~15fps, MPEG-1 DC VLC with DPCM
-//         (AC coefficient coding not yet reverse-engineered)
+//  Video: 248×216, 4:2:0, 4×4 DCT blocks, run/level VLC with DC
+//         prediction per macroblock
 //  Audio: CD-ROM XA ADPCM (decoded in hardware path)
 //
 //  The libavcodec path is kept for potential MPEG-PS/VCD content.
@@ -38,74 +37,6 @@
 
 // Internal ES (Elementary Stream) accumulator
 #define ES_BUF_SIZE  (256 * 1024)   // 256KB — enough for several frames
-
-// ── Runtime-tunable codec parameters ─────────────────────────
-typedef struct CodecParams {
-    int  ac_count;       // AC coefficients per block (default 10)
-    int  dc_mode;        // 0=init+diff, 1=DPCM accumulate
-    int  dc_scale;       // DC multiplier (default 8)
-    int  bs_offset;      // bitstream start byte (default 44)
-    int  width;          // frame width (default 192)
-    int  height;         // frame height (default 144)
-    int  level_shift;    // added to pixel after IDCT (default 0)
-    bool use_eob;        // treat VLC 0 as EOB (default false)
-    int  ac_dequant;     // 0=none (raw VLC), 1=qtable*qscale/8
-    int  scan_order;     // 0=row-major, 1=col-major, 2=zigzag, 3=boustrophedon
-                         // 4=interleaved-2, 5=reverse-row, 6=bottom-up
-    int  block_order;    // Y block layout in MB: 0=Z(00,10,01,11), 1=N(00,01,10,11)
-                         // 2=U-pattern, 3=reverse-Z
-    int  dc_only;        // 0=normal, 1=DC only (no AC, shows block-level thumbnail)
-    int  grid_overlay;   // 0=off, 1=8x8 block grid, 2=MB grid, 3=both
-    int  chroma_mode;    // 0=4:2:0 (6 blocks/MB), 1=4:2:2 (8), 2=4:1:1 (6alt), 3=mono(4)
-    int  zigzag_alt;     // 0=standard MPEG-1, 1=alternate (MPEG-2), 2=raster (no zigzag)
-    int  mb_size;        // 0=16x16, 1=8x8 (each "MB" is one block)
-    int  interleave;     // 0=MB-interleaved (4Y+Cb+Cr per MB)
-                         // 1=plane (all Y, then all Cb, then all Cr)
-                         // 2=Y-only (treat all blocks as Y)
-    int  vlc_invert;     // 0=normal MPEG-1 size mapping (short code -> small size)
-                         // 1=inverted (short code -> large size). Test: 6× wider DC
-                         //   diff std on Keroppi but with -29 mean bias.
-    int  dc_diff_mult;   // 0=raw diff, 1=diff*qscale, 2=diff*qtable[0]
-                         // Hypothesis: DC = init + diff × qscale gives needed range.
-
-    int  selected;       // currently selected param for UI
-
-    // ── Auto-tune state ──────────────────────────────────────
-    bool autotune;       // auto-tune active
-    int  tune_param;     // which param we're currently tuning
-    int  tune_step;      // current step: 0=baseline, 1=try+, 2=try-
-    double best_score;   // best score so far
-    int  tune_wait;      // frames to wait before measuring
-    int  stale_count;    // consecutive params with no improvement
-    bool save_frame;     // flag: save next frame to /tmp
-} CodecParams;
-
-#define CODEC_PARAM_COUNT 19
-
-void    codec_params_init   (CodecParams *cp);
-void    codec_params_adjust (CodecParams *cp, int delta);
-void    codec_params_next   (CodecParams *cp);
-void    codec_params_prev   (CodecParams *cp);
-void    codec_params_print  (const CodecParams *cp);
-
-// Frame quality score (higher = better image structure)
-double  codec_frame_score   (const uint8_t *framebuffer, int fb_w, int fb_h,
-                             int img_w, int img_h);
-// Auto-tune step — call once per frame after decode
-void    codec_autotune_step (CodecParams *cp, double score);
-
-// ── Reference-image scoring (for autotune against ground truth) ──
-// Load a PNG via ImageMagick `convert` into a 192×144 RGB buffer.
-// Returns true on success.  The bundled `reference/pd_real_*.png`
-// files are the intended input.
-bool    codec_load_reference(const char *png_path,
-                             uint8_t *out_rgb, int w, int h);
-// Pearson correlation between the decoded video region (centered
-// 192×144 inside the 320×240 framebuffer) and a reference image of
-// the same dimensions.  Returns a value in [-1, +1]; ~0 = noise,
-// 0.5+ = visible correlation.
-double  codec_pearson_score(const uint8_t *framebuffer, int fb_w, int fb_h,
-                            const uint8_t *ref_rgb, int ref_w, int ref_h);
 
 typedef struct AK8000 {
     // ── Registers ─────────────────────────────────────────
@@ -160,7 +91,6 @@ typedef struct AK8000 {
     // ── Playdia video state ───────────────────────────────────
     uint8_t  qtable[16];             // 4×4 quantization table
     uint8_t  qscale;                 // quantization scale factor
-    int      dc_pred[3];             // DC DPCM predictors (Y, Cb, Cr)
 
     // ── Frame queue (multi-frame packets produce 2-4 frames) ──
     #define PD_FRAME_QUEUE_SIZE 8
@@ -181,9 +111,6 @@ typedef struct AK8000 {
     uint32_t seek_target;           // LBA to seek to (0 = none pending)
     uint32_t cmd_lba;               // LBA where last F2 command was found
     bool     is_loop;               // true if F2 40 is a backward jump (loop)
-
-    // ── Codec tuning (runtime-adjustable) ─────────────────────
-    CodecParams  codec_params;
 } AK8000;
 
 // ── API ───────────────────────────────────────────────────────

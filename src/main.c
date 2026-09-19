@@ -57,42 +57,10 @@ static void run_cpu_test(void) {
            p.cpu.A, (p.cpu.F & FLAG_Z) ? 1 : 0);
 }
 
-// ─── Headless run (no SDL) ────────────────────────────────────
-//
-//  If `ref_path` is non-NULL, autotune uses Pearson-vs-reference
-//  scoring instead of the heuristic codec_frame_score().  This is
-//  the only objective fidelity metric we have — the heuristic score
-//  rewards entropy/structure and can be gamed by the optimizer.
-//
-static uint8_t g_ref_rgb[192 * 144 * 3];
-static bool    g_ref_loaded = false;
-static int     g_ref_w = 192, g_ref_h = 144;
+// ─── Headless run (no SDL) ──────────────────────────────
 
-static void run_headless(Playdia *p, uint32_t max_frames, bool autotune,
-                         const char *ref_path) {
+static void run_headless(Playdia *p, uint32_t max_frames) {
     printf("[Headless] Running %u frames...\n", max_frames);
-    double score_sum = 0; int score_n = 0;
-
-    if (ref_path) {
-        g_ref_loaded = codec_load_reference(ref_path, g_ref_rgb,
-                                            g_ref_w, g_ref_h);
-        if (g_ref_loaded)
-            printf("[Headless] Pearson-vs-reference scoring ENABLED\n");
-        else
-            printf("[Headless] Reference load FAILED — falling back to heuristic score\n");
-    }
-
-    if (autotune) {
-        CodecParams *cp = &p->video.codec_params;
-        cp->autotune = true;
-        cp->tune_param = 0;
-        cp->tune_step = 0;
-        cp->tune_wait = 10; // let a few frames decode first
-        cp->best_score = -2.0;  // Pearson can be negative; start below floor
-        cp->stale_count = 0;
-        printf("[TUNE] Auto-tune ENABLED in headless mode\n");
-        codec_params_print(cp);
-    }
 
     for (uint32_t f = 0; f < max_frames && p->running; f++) {
         // Auto-advance in headless: break loops and auto-choose
@@ -105,24 +73,6 @@ static void run_headless(Playdia *p, uint32_t max_frames, bool autotune,
 
         playdia_run_frame(p);
         pipeline_drain_audio(&p->pipe, &p->video);
-
-        // Per-frame scoring (always, so external sweepers can read it).
-        if (p->video.got_video_frame) {
-            CodecParams *cp = &p->video.codec_params;
-            double score;
-            if (g_ref_loaded) {
-                score = codec_pearson_score(
-                    p->video.framebuffer, SCREEN_W, SCREEN_H,
-                    g_ref_rgb, g_ref_w, g_ref_h);
-            } else {
-                score = codec_frame_score(
-                    p->video.framebuffer, SCREEN_W, SCREEN_H,
-                    cp->width, cp->height);
-            }
-            score_sum += score; score_n++;
-            if (cp->autotune)
-                codec_autotune_step(cp, score);
-        }
 
         // Save snapshot every 100 frames
         if (p->video.frame_count > 0 && p->video.frame_count % 100 == 0) {
@@ -137,28 +87,8 @@ static void run_headless(Playdia *p, uint32_t max_frames, bool autotune,
         }
         if (f % 30 == 0)
             printf("[Headless] frame=%u  ~%.1fs\n", f, f / 30.0f);
-
-        // Stop early if autotune converged
-        if (autotune && !p->video.codec_params.autotune) {
-            printf("[Headless] Auto-tune converged at frame %u\n", f);
-            // Run 30 more frames to get clean output
-            for (int extra = 0; extra < 30 && p->running; extra++) {
-                if (p->video.is_loop && p->video.interactive_cmd == 0x40)
-                    p->controller = BTN_START;
-                else if (p->video.waiting_for_input)
-                    p->controller = BTN_A;
-                else p->controller = 0;
-                playdia_run_frame(p);
-                pipeline_drain_audio(&p->pipe, &p->video);
-            }
-            break;
-        }
     }
     printf("[Headless] Done. %u frames total.\n", p->frames);
-    if (score_n > 0)
-        printf("[Headless] AvgScore=%.4f (n=%d)\n", score_sum / score_n, score_n);
-    printf("[Headless] Final codec params:\n");
-    codec_params_print(&p->video.codec_params);
 
     // Save last framebuffer
     {
@@ -206,22 +136,9 @@ int main(int argc, char *argv[]) {
     const char *iso_path = NULL;
     bool debug    = false;
     bool headless = false;
-    bool autotune = false;
-
-    const char *codec_str = NULL;
-    const char *ref_path  = NULL;
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--debug")    == 0) debug    = true;
         else if (strcmp(argv[i], "--headless") == 0) headless = true;
-        else if (strcmp(argv[i], "--autotune") == 0) { autotune = true; headless = true; }
-        else if (strncmp(argv[i], "--reference", 11) == 0) {
-            if (argv[i][11] == '=') ref_path = argv[i] + 12;
-            else if (i + 1 < argc) ref_path = argv[++i];
-        }
-        else if (strncmp(argv[i], "--codec", 7) == 0) {
-            if (argv[i][7] == '=' ) codec_str = argv[i] + 8;
-            else if (i + 1 < argc) codec_str = argv[++i];
-        }
         else if (argv[i][0] != '-')                  iso_path = argv[i];
     }
 
@@ -242,46 +159,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Apply codec param overrides: --codec "ac_count=5,dc_only=1,scan_order=3"
-    if (codec_str) {
-        CodecParams *cp = &playdia->video.codec_params;
-        char buf[256];
-        strncpy(buf, codec_str, sizeof(buf)-1); buf[sizeof(buf)-1] = 0;
-        for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
-            char *eq = strchr(tok, '=');
-            if (!eq) continue;
-            *eq = 0;
-            int val = atoi(eq + 1);
-            if      (strcmp(tok,"ac_count")==0)    cp->ac_count = val;
-            else if (strcmp(tok,"dc_mode")==0)     cp->dc_mode = val;
-            else if (strcmp(tok,"dc_scale")==0)    cp->dc_scale = val;
-            else if (strcmp(tok,"bs_offset")==0)   cp->bs_offset = val;
-            else if (strcmp(tok,"width")==0)       cp->width = val;
-            else if (strcmp(tok,"height")==0)      cp->height = val;
-            else if (strcmp(tok,"level_shift")==0) cp->level_shift = val;
-            else if (strcmp(tok,"use_eob")==0)     cp->use_eob = val;
-            else if (strcmp(tok,"ac_dequant")==0)  cp->ac_dequant = val;
-            else if (strcmp(tok,"scan_order")==0)  cp->scan_order = val;
-            else if (strcmp(tok,"block_order")==0) cp->block_order = val;
-            else if (strcmp(tok,"dc_only")==0)     cp->dc_only = val;
-            else if (strcmp(tok,"grid")==0)        cp->grid_overlay = val;
-            else if (strcmp(tok,"chroma")==0)      cp->chroma_mode = val;
-            else if (strcmp(tok,"zigzag")==0)      cp->zigzag_alt = val;
-            else if (strcmp(tok,"mb_size")==0)     cp->mb_size = val;
-            else if (strcmp(tok,"interleave")==0) cp->interleave = val;
-            else if (strcmp(tok,"vlc_invert")==0) cp->vlc_invert = val;
-            else if (strcmp(tok,"dc_diff_mult")==0) cp->dc_diff_mult = val;
-            else fprintf(stderr, "Unknown codec param: %s\n", tok);
-        }
-        printf("[Main] Codec overrides applied:\n");
-        codec_params_print(cp);
-    }
-
     printf("[Main] Disc loaded: %s\n", iso_path);
 
     // ── Headless mode ─────────────────────────────────────
     if (headless) {
-        run_headless(playdia, autotune ? 1500 : 600, autotune, ref_path);
+        run_headless(playdia, 600);
         free(playdia);
         return 0;
     }
@@ -290,7 +172,7 @@ int main(int argc, char *argv[]) {
     SDLFrontend fe;
     if (sdl_init(&fe, "Playdia Emulator") != 0) {
         fprintf(stderr, "[Main] SDL init failed — falling back to headless\n");
-        run_headless(playdia, 300, false, NULL);
+        run_headless(playdia, 300);
         free(playdia);
         return 0;
     }
@@ -303,23 +185,14 @@ int main(int argc, char *argv[]) {
     printf("  F1          = Toggle fullscreen\n");
     printf("  Escape      = Quit\n");
     printf("\n");
-    printf("[Main] Codec tuning:\n");
-    printf("  Tab / Shift+Tab  = select parameter\n");
-    printf("  + / -            = adjust +1 / -1\n");
-    printf("  ] / [            = adjust +5 / -5\n");
-    printf("  P                = print current params\n");
-    printf("  R                = reset params to defaults\n");
-    printf("  S                = save current frame to /tmp\n");
-    printf("  T                = toggle auto-tune\n\n");
-    codec_params_print(&playdia->video.codec_params);
 
     // ── Main loop ─────────────────────────────────────────
     const uint64_t FRAME_US = 1000000ULL / FPS;   // 33333µs per frame @ 30fps
     uint64_t frame_start = now_us();
 
     while (playdia->running && fe.running) {
-        // Poll SDL events → update controller + codec tuning
-        if (!sdl_poll_events_ex(&fe, &playdia->controller, &playdia->video.codec_params))
+        // Poll SDL events → update controller
+        if (!sdl_poll_events(&fe, &playdia->controller))
             break;
 
         // Emulate one frame
@@ -332,34 +205,6 @@ int main(int argc, char *argv[]) {
         int pairs = pipeline_drain_audio(&playdia->pipe, &playdia->video);
         if (pairs > 0)
             sdl_queue_audio(&fe, playdia->pipe.drain_buf, pairs);
-
-        // Save frame on request (S key)
-        if (playdia->video.codec_params.save_frame) {
-            playdia->video.codec_params.save_frame = false;
-            static int save_counter = 0;
-            char fname[64];
-            snprintf(fname, sizeof fname, "/tmp/pd_save_%03d.ppm", save_counter++);
-            FILE *sf = fopen(fname, "wb");
-            if (sf) {
-                fprintf(sf, "P6\n%d %d\n255\n", SCREEN_W, SCREEN_H);
-                fwrite(playdia->video.framebuffer, SCREEN_W * SCREEN_H * 3, 1, sf);
-                fclose(sf);
-                printf("[Main] Saved frame to %s\n", fname);
-                // Also convert to PNG
-                char cmd[128];
-                snprintf(cmd, sizeof cmd, "convert %s %.*s.png 2>/dev/null &", fname, (int)(strlen(fname)-4), fname);
-                (void)!system(cmd);
-            }
-        }
-
-        // Auto-tune: score frame and adjust params
-        if (playdia->video.codec_params.autotune && playdia->video.got_video_frame) {
-            CodecParams *cp = &playdia->video.codec_params;
-            double score = codec_frame_score(
-                playdia->video.framebuffer, SCREEN_W, SCREEN_H,
-                cp->width, cp->height);
-            codec_autotune_step(cp, score);
-        }
 
         // Debug dump every 60 frames
         if (debug && (playdia->frames % 60 == 0)) {
