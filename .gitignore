@@ -39,3 +39,4 @@ raw_vis
 # Tool binaries (source in tools/*.c is tracked)
 tools/vcodec_*
 !tools/vcodec_*.c
+playdia_libretro.so

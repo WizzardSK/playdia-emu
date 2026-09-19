@@ -1,8 +1,10 @@
 #pragma once
 #include "playdia.h"
+#ifdef PD_USE_FFMPEG
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libswscale/swscale.h>
+#endif
 
 // ─────────────────────────────────────────────────────────────
 //  Asahi Kasei AK8000  —  Audio/Video Processor
@@ -64,6 +66,7 @@ typedef struct AK8000 {
     uint8_t  aud_es[ES_BUF_SIZE];   // Audio elementary stream
     int      aud_es_len;
 
+#ifdef PD_USE_FFMPEG
     // ── libavcodec video decoder ──────────────────────────
     const AVCodec      *vid_codec;
     AVCodecContext     *vid_ctx;
@@ -78,6 +81,8 @@ typedef struct AK8000 {
     AVFrame            *aud_frame;
     AVPacket           *aud_pkt;
     bool                acodec_ready;
+
+#endif
 
     // ── XA ADPCM decoder (hardware path) ─────────────────────
     int32_t  xa_prev[2];    // previous samples per channel

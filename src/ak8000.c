@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <math.h>
 
+#ifdef PD_USE_FFMPEG
 static void init_video_codec(AK8000 *v) {
     v->vid_codec = avcodec_find_decoder(AV_CODEC_ID_MPEG1VIDEO);
     if (!v->vid_codec) { fprintf(stderr,"[AK8000] No MPEG-1 video codec\n"); return; }
@@ -36,6 +37,10 @@ static void init_audio_codec(AK8000 *v) {
     v->acodec_ready = true;
     printf("[AK8000] MP2 audio decoder ready\n");
 }
+#else
+static void init_video_codec(AK8000 *v) { (void)v; }
+static void init_audio_codec(AK8000 *v) { (void)v; }
+#endif
 
 void ak8000_init(AK8000 *v) {
     memset(v, 0, sizeof *v);
@@ -59,6 +64,7 @@ void ak8000_reset(AK8000 *v) {
 }
 
 void ak8000_free(AK8000 *v) {
+#ifdef PD_USE_FFMPEG
     if (v->sws_ctx)   { sws_freeContext(v->sws_ctx);        v->sws_ctx   = NULL; }
     if (v->vid_frame) { av_frame_free(&v->vid_frame); }
     if (v->vid_pkt)   { av_packet_free(&v->vid_pkt); }
@@ -66,6 +72,9 @@ void ak8000_free(AK8000 *v) {
     if (v->aud_frame) { av_frame_free(&v->aud_frame); }
     if (v->aud_pkt)   { av_packet_free(&v->aud_pkt); }
     if (v->aud_ctx)   { avcodec_free_context(&v->aud_ctx); }
+#else
+    (void)v;
+#endif
 }
 
 void ak8000_write_reg(AK8000 *v, uint8_t reg, uint8_t val) {
@@ -81,6 +90,7 @@ uint8_t ak8000_read_reg(AK8000 *v, uint8_t reg) {
     return (reg < 16) ? v->regs[reg] : 0xFF;
 }
 
+#ifdef PD_USE_FFMPEG
 /* YUV frame → RGB888 framebuffer via swscale */
 static void yuv_to_rgb(AK8000 *v, AVFrame *f) {
     if (!v->sws_ctx || v->vid_ctx->width != f->width || v->vid_ctx->height != f->height) {
@@ -164,6 +174,11 @@ static void flush_audio_es(AK8000 *v) {
     }
     v->aud_es_len = 0;
 }
+
+#else
+static void flush_video_es(AK8000 *v) { v->vid_es_len = 0; }
+static void flush_audio_es(AK8000 *v) { v->aud_es_len = 0; }
+#endif
 
 static inline uint32_t r32be(const uint8_t *p) {
     return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];

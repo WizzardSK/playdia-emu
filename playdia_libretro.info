@@ -1,0 +1,33 @@
+# Software Information
+display_name = "Bandai - Playdia (PlaydiaEmu)"
+authors = "WizzardSK"
+supported_extensions = "cue|bin|iso|zip"
+corename = "PlaydiaEmu"
+categories = "Emulator"
+license = "GPLv3"
+permissions = ""
+display_version = "0.1"
+
+# Hardware Information
+manufacturer = "Bandai"
+systemname = "Playdia"
+systemid = "playdia"
+
+# Libretro Features
+database = "Playdia"
+supports_no_game = "false"
+firmware_count = 0
+savestate = "false"
+cheats = "false"
+input_descriptors = "true"
+memory_descriptors = "false"
+libretro_saves = "false"
+core_options = "false"
+load_subsystem = "false"
+hw_render = "false"
+needs_fullpath = "true"
+block_extract = "true"
+disk_control = "false"
+is_experimental = "true"
+
+description = "Emulator for the Bandai Playdia, a 1994 Japanese FMV console. Plays CD-ROM XA discs: the AK8000 picture codec, XA ADPCM audio and the F2 interactive commands that drive the menus."
