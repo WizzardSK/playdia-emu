@@ -1,5 +1,5 @@
 #include "zip_stream.h"
-#include "miniz/miniz.h"
+#include "vfs_file.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>  // strcasecmp
@@ -29,7 +29,7 @@
 #define ZIP_CACHE_THRESHOLD  (4 * 1024 * 1024)  // 4 MB
 
 struct ZipStream {
-    mz_zip_archive  za;          // zip archive
+    PdZip       zip;         // archive plus the FILE* it reads through
     mz_zip_reader_extract_iter_state *iter;  // current entry reader
     int         entry_index; // entry index inside archive
     char        entry_name[512];
@@ -49,17 +49,41 @@ static const char *za_error(mz_zip_archive *za)
     return mz_zip_get_error_string(mz_zip_get_last_error(za));
 }
 
-// Open an archive read-only, or NULL
-static int open_archive(mz_zip_archive *za, const char *path)
+// Open an archive read-only. The file is opened through pd_fopen so a path
+// only the frontend can resolve works as well as a local one.
+bool pd_zip_open(PdZip *z, const char *zip_path)
 {
-    mz_zip_zero_struct(za);
+    memset(z, 0, sizeof *z);
+    mz_zip_zero_struct(&z->za);
 
-    if (!mz_zip_reader_init_file(za, path, 0)) {
-        fprintf(stderr, "[ZIP] Cannot open %s: %s\n", path, za_error(za));
-        return -1;
+    z->fp = pd_fopen(zip_path, "rb");
+    if (!z->fp) {
+        fprintf(stderr, "[ZIP] Cannot open %s\n", zip_path);
+        return false;
     }
 
-    return 0;
+    if (fseek(z->fp, 0, SEEK_END) != 0) {
+        fclose(z->fp); z->fp = NULL;
+        return false;
+    }
+
+    const long size = ftell(z->fp);
+    rewind(z->fp);
+
+    if (size <= 0 || !mz_zip_reader_init_cfile(&z->za, z->fp, (mz_uint64)size, 0)) {
+        fprintf(stderr, "[ZIP] Cannot read %s: %s\n", zip_path, za_error(&z->za));
+        fclose(z->fp); z->fp = NULL;
+        return false;
+    }
+
+    return true;
+}
+
+void pd_zip_close(PdZip *z)
+{
+    if (!z) return;
+    mz_zip_reader_end(&z->za);
+    if (z->fp) { fclose(z->fp); z->fp = NULL; }
 }
 
 // Start reading entry idx from byte 0
@@ -85,34 +109,34 @@ ZipStream *zs_open_index(const char *zip_path, int entry_index) {
     ZipStream *zs = calloc(1, sizeof *zs);
     if (!zs) return NULL;
 
-    if (open_archive(&zs->za, zip_path) != 0) {
+    if (!pd_zip_open(&zs->zip, zip_path)) {
         free(zs);
         return NULL;
     }
 
-    const int n_entries = (int)mz_zip_reader_get_num_files(&zs->za);
+    const int n_entries = (int)mz_zip_reader_get_num_files(&zs->zip.za);
     if (entry_index < 0 || entry_index >= n_entries) {
         fprintf(stderr, "[ZIP] Entry index %d out of range (%d entries)\n",
                 entry_index, n_entries);
-        mz_zip_reader_end(&zs->za);
+        pd_zip_close(&zs->zip);
         free(zs);
         return NULL;
     }
 
     mz_zip_archive_file_stat st;
-    if (!mz_zip_reader_file_stat(&zs->za, (mz_uint)entry_index, &st)) {
+    if (!mz_zip_reader_file_stat(&zs->zip.za, (mz_uint)entry_index, &st)) {
         fprintf(stderr, "[ZIP] stat failed for entry %d: %s\n",
-                entry_index, za_error(&zs->za));
-        mz_zip_reader_end(&zs->za);
+                entry_index, za_error(&zs->zip.za));
+        pd_zip_close(&zs->zip);
         free(zs);
         return NULL;
     }
 
-    zs->iter = open_entry(&zs->za, entry_index);
+    zs->iter = open_entry(&zs->zip.za, entry_index);
     if (!zs->iter) {
         fprintf(stderr, "[ZIP] Cannot open entry %d: %s\n",
-                entry_index, za_error(&zs->za));
-        mz_zip_reader_end(&zs->za);
+                entry_index, za_error(&zs->zip.za));
+        pd_zip_close(&zs->zip);
         free(zs);
         return NULL;
     }
@@ -141,18 +165,18 @@ ZipStream *zs_open_index(const char *zip_path, int entry_index) {
 }
 
 ZipStream *zs_open_suffix(const char *zip_path, const char *suffix) {
-    mz_zip_archive za;
+    PdZip z;
 
-    if (open_archive(&za, zip_path) != 0)
+    if (!pd_zip_open(&z, zip_path))
         return NULL;
 
-    const int n = (int)mz_zip_reader_get_num_files(&za);
+    const int n = (int)mz_zip_reader_get_num_files(&z.za);
     const size_t suf_len = strlen(suffix);
     int best = -1;
 
     for (int i = 0; i < n; i++) {
         char name[512];
-        if (!mz_zip_reader_get_filename(&za, (mz_uint)i, name, sizeof name))
+        if (!mz_zip_reader_get_filename(&z.za, (mz_uint)i, name, sizeof name))
             continue;
 
         const size_t nl = strlen(name);
@@ -162,7 +186,7 @@ ZipStream *zs_open_suffix(const char *zip_path, const char *suffix) {
         }
     }
 
-    mz_zip_reader_end(&za);
+    pd_zip_close(&z);
 
     if (best < 0) {
         fprintf(stderr, "[ZIP] No entry with suffix \"%s\" in %s\n",
@@ -173,22 +197,22 @@ ZipStream *zs_open_suffix(const char *zip_path, const char *suffix) {
 }
 
 void zs_list(const char *zip_path) {
-    mz_zip_archive za;
+    PdZip z;
 
-    if (open_archive(&za, zip_path) != 0)
+    if (!pd_zip_open(&z, zip_path))
         return;
 
-    const int n = (int)mz_zip_reader_get_num_files(&za);
+    const int n = (int)mz_zip_reader_get_num_files(&z.za);
     printf("[ZIP] %s — %d entries:\n", zip_path, n);
 
     for (int i = 0; i < n; i++) {
         mz_zip_archive_file_stat st;
-        if (!mz_zip_reader_file_stat(&za, (mz_uint)i, &st)) continue;
+        if (!mz_zip_reader_file_stat(&z.za, (mz_uint)i, &st)) continue;
         printf("  [%2d] %-40s  %7ld KB\n",
                i, st.m_filename, (long)(st.m_uncomp_size / 1024));
     }
 
-    mz_zip_reader_end(&za);
+    pd_zip_close(&z);
 }
 
 const char *zs_name(ZipStream *zs) { return zs->entry_name; }
@@ -234,7 +258,7 @@ int zs_seek(ZipStream *zs, long offset, int whence) {
 
     // Backward seek: restart the entry, then skip forward
     mz_zip_reader_extract_iter_free(zs->iter);
-    zs->iter = open_entry(&zs->za, zs->entry_index);
+    zs->iter = open_entry(&zs->zip.za, zs->entry_index);
     if (!zs->iter) return -1;
     zs->pos = 0;
     if (new_pos > 0 && skip_forward(zs->iter, new_pos) != 0) return -1;
@@ -245,7 +269,7 @@ int zs_seek(ZipStream *zs, long offset, int whence) {
 void zs_close(ZipStream *zs) {
     if (!zs) return;
     if (zs->iter) mz_zip_reader_extract_iter_free(zs->iter);
-    mz_zip_reader_end(&zs->za);
+    pd_zip_close(&zs->zip);
     free(zs->cache);
     free(zs);
 }

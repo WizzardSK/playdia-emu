@@ -10,6 +10,7 @@
 #include "libretro.h"
 #include "playdia_sys.h"
 #include "ak8000_pd.h"
+#include "vfs_file.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,13 @@ void retro_set_environment(retro_environment_t cb)
         { 0 },
     };
     cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)desc);
+
+    // With need_fullpath the core opens the disc itself, and on Android the
+    // path is a SAF content:// URI that only the frontend can resolve.
+    struct retro_vfs_interface_info vfs_info = { 1, NULL };
+
+    if (cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_info) && vfs_info.iface)
+        pd_vfs_set_interface(vfs_info.iface, vfs_info.required_interface_version);
 }
 
 void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }

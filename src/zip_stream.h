@@ -13,6 +13,18 @@
 //  interchangeable between real files and zip entries.
 // ═══════════════════════════════════════════════════════════════
 
+#include "miniz/miniz.h"
+
+// An archive opened through pd_fopen. miniz does not close a FILE* it was
+// handed, so the handle is kept alongside it.
+typedef struct {
+    mz_zip_archive za;
+    FILE          *fp;
+} PdZip;
+
+bool pd_zip_open(PdZip *z, const char *zip_path);
+void pd_zip_close(PdZip *z);
+
 typedef struct ZipStream ZipStream;
 
 // Open a specific entry by index inside zip_path.

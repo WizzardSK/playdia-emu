@@ -1,6 +1,6 @@
 #include "cdrom.h"
 #include "zip_stream.h"
-#include "miniz/miniz.h"
+#include "vfs_file.h"
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -33,7 +33,7 @@ void cdrom_reset(CDROM *cd) {
 // ─────────────────────────────────────────────────────────────
 int cdrom_load_iso(CDROM *cd, const char *path) {
     cds_close(&cd->src);
-    cd->src.fp = fopen(path,"rb");
+    cd->src.fp = pd_fopen(path, "rb");
     if (!cds_valid(&cd->src)) { fprintf(stderr,"[CDROM] Cannot open: %s\n",path); return -1; }
     long sz = cds_size(&cd->src);
 
@@ -390,7 +390,7 @@ static void resolve_path(const char *cue_path, const char *bin_name,
 }
 
 int cdrom_load_cue(CDROM *cd, const char *cue_path) {
-    FILE *cue = fopen(cue_path, "r");
+    FILE *cue = pd_fopen(cue_path, "r");
     if (!cue) {
         fprintf(stderr, "[CDROM] Cannot open CUE: %s\n", cue_path);
         return -1;
@@ -459,7 +459,7 @@ int cdrom_load_cue(CDROM *cd, const char *cue_path) {
     // If only one BIN file, use legacy single-source mode
     if (n_bin_files == 1) {
         cds_close(&cd->src);
-        cd->src.fp = fopen(bin_paths[0], "rb");
+        cd->src.fp = pd_fopen(bin_paths[0], "rb");
         if (!cd->src.fp) {
             fprintf(stderr, "[CDROM] Cannot open BIN: %s\n", bin_paths[0]);
             return -1;
@@ -490,7 +490,7 @@ int cdrom_load_cue(CDROM *cd, const char *cue_path) {
     uint32_t lba_cursor = 0;
 
     for (int i = 0; i < n_bin_files && cd->n_track_srcs < MAX_TRACK_SRCS; i++) {
-        FILE *fp = fopen(bin_paths[i], "rb");
+        FILE *fp = pd_fopen(bin_paths[i], "rb");
         if (!fp) {
             fprintf(stderr, "[CDROM] Cannot open BIN: %s\n", bin_paths[i]);
             continue;
@@ -549,39 +549,37 @@ int cdrom_load_cue(CDROM *cd, const char *cue_path) {
 
 // Find entry index by filename (case-insensitive)
 static int zip_find_name(const char *zip_path, const char *name) {
-    mz_zip_archive za;
-    mz_zip_zero_struct(&za);
-    if (!mz_zip_reader_init_file(&za, zip_path, 0)) return -1;
+    PdZip z;
+    if (!pd_zip_open(&z, zip_path)) return -1;
 
-    const int n = (int)mz_zip_reader_get_num_files(&za);
+    const int n = (int)mz_zip_reader_get_num_files(&z.za);
     int found = -1;
 
     for (int i = 0; i < n; i++) {
         char en[512];
-        if (!mz_zip_reader_get_filename(&za, (mz_uint)i, en, sizeof en)) continue;
+        if (!mz_zip_reader_get_filename(&z.za, (mz_uint)i, en, sizeof en)) continue;
         // Strip directory component
         const char *base = strrchr(en, '/');
         base = base ? base+1 : en;
         if (strcasecmp(base, name) == 0) { found = i; break; }
     }
 
-    mz_zip_reader_end(&za);
+    pd_zip_close(&z);
     return found;
 }
 
 // Find the largest .bin entry (likely the disc image)
 static int zip_find_largest_bin(const char *zip_path) {
-    mz_zip_archive za;
-    mz_zip_zero_struct(&za);
-    if (!mz_zip_reader_init_file(&za, zip_path, 0)) return -1;
+    PdZip z;
+    if (!pd_zip_open(&z, zip_path)) return -1;
 
-    const int n = (int)mz_zip_reader_get_num_files(&za);
+    const int n = (int)mz_zip_reader_get_num_files(&z.za);
     int best = -1;
     mz_uint64 best_sz = 0;
 
     for (int i = 0; i < n; i++) {
         mz_zip_archive_file_stat st;
-        if (!mz_zip_reader_file_stat(&za, (mz_uint)i, &st)) continue;
+        if (!mz_zip_reader_file_stat(&z.za, (mz_uint)i, &st)) continue;
         const size_t nl = strlen(st.m_filename);
         if (nl >= 4 && strcasecmp(st.m_filename + nl - 4, ".bin") == 0
             && st.m_uncomp_size > best_sz && st.m_uncomp_size > 2352) {
@@ -589,33 +587,32 @@ static int zip_find_largest_bin(const char *zip_path) {
         }
     }
 
-    mz_zip_reader_end(&za);
+    pd_zip_close(&z);
     return best;
 }
 
 // Read CUE text from a zip entry into a malloc'd buffer
 static char *zip_read_text_entry(const char *zip_path, int idx) {
-    mz_zip_archive za;
-    mz_zip_zero_struct(&za);
-    if (!mz_zip_reader_init_file(&za, zip_path, 0)) return NULL;
+    PdZip z;
+    if (!pd_zip_open(&z, zip_path)) return NULL;
 
     mz_zip_archive_file_stat st;
-    if (!mz_zip_reader_file_stat(&za, (mz_uint)idx, &st) || st.m_uncomp_size > 65536) {
-        mz_zip_reader_end(&za);
+    if (!mz_zip_reader_file_stat(&z.za, (mz_uint)idx, &st) || st.m_uncomp_size > 65536) {
+        pd_zip_close(&z);
         return NULL;
     }
 
     char *buf = malloc((size_t)st.m_uncomp_size + 1);
-    if (!buf) { mz_zip_reader_end(&za); return NULL; }
+    if (!buf) { pd_zip_close(&z); return NULL; }
 
-    if (!mz_zip_reader_extract_to_mem(&za, (mz_uint)idx, buf, (size_t)st.m_uncomp_size, 0)) {
+    if (!mz_zip_reader_extract_to_mem(&z.za, (mz_uint)idx, buf, (size_t)st.m_uncomp_size, 0)) {
         free(buf);
-        mz_zip_reader_end(&za);
+        pd_zip_close(&z);
         return NULL;
     }
 
     buf[st.m_uncomp_size] = '\0';
-    mz_zip_reader_end(&za);
+    pd_zip_close(&z);
     return buf;
 }
 
@@ -744,19 +741,18 @@ int cdrom_load_zip(CDROM *cd, const char *zip_path) {
     // ── Strategy 1: find a .cue entry ────────────────────────
     int cue_idx = -1;
     {
-        mz_zip_archive za;
-        mz_zip_zero_struct(&za);
-        if (mz_zip_reader_init_file(&za, zip_path, 0)) {
-            const int n = (int)mz_zip_reader_get_num_files(&za);
+        PdZip z;
+        if (pd_zip_open(&z, zip_path)) {
+            const int n = (int)mz_zip_reader_get_num_files(&z.za);
             for (int i = 0; i < n; i++) {
                 char name[512];
-                if (!mz_zip_reader_get_filename(&za, (mz_uint)i, name, sizeof name))
+                if (!mz_zip_reader_get_filename(&z.za, (mz_uint)i, name, sizeof name))
                     continue;
                 const size_t nl = strlen(name);
                 if (nl >= 4 && strcasecmp(name + nl - 4, ".cue") == 0)
                     { cue_idx = i; break; }
             }
-            mz_zip_reader_end(&za);
+            pd_zip_close(&z);
         }
     }
     if (cue_idx >= 0) {

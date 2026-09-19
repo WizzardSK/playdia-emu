@@ -13,21 +13,36 @@ Emulator for the **Bandai Playdia** (1994), an obscure Japanese FMV console.
 ## Building
 
 ```bash
-make
+make            # standalone, SDL2 window
+make libretro   # libretro core
 ```
 
-Dependencies: SDL2, libavcodec, libavutil, libswscale, libzip
+Dependencies for the standalone: SDL2, libavcodec, libavutil, libswscale. Zips are read with the vendored miniz, so libzip is not needed.
+
+The libretro core needs none of those - only a C compiler and libm. It is built from `Makefile.libretro`, which carries the platform handling:
+
+```bash
+make -f Makefile.libretro platform=unix        # also osx, ios, android, emscripten, libnx, win
+```
 
 ## Running
 
 ```bash
 ./playdia game.cue              # Run with SDL2 window
-./playdia game.cue --headless   # Run without display (300 frames)
+./playdia game.cue --headless   # Run without display (600 frames)
 ./playdia game.cue --debug      # Run with per-second stats
 ./playdia --test                # CPU self-test
 ```
 
 Controls: Arrow keys = D-pad, Z (or Y on QWERTZ)/X = A/B, Enter = Start, Space = Select, F1 = Fullscreen, Esc = Quit
+
+In the libretro core the same buttons are the RetroPad's D-pad, A, B, Start and Select.
+
+## libretro core
+
+`playdia_libretro.so` hands the frontend the 248×216 picture at 4:3, 30 fps and 44100 Hz, and takes `.cue`, `.bin`, `.iso` and Redump `.zip` by path. It sets `need_fullpath`, so it opens the disc itself; a path the C library cannot resolve - an Android SAF `content://` URI - goes through the frontend's VFS instead, wrapped back into a `FILE*` (`src/vfs_file.c`).
+
+Save states are not implemented: the emulator has no serialiser yet, so rewind, run-ahead and netplay are out until it grows one.
 
 ## Emulator Status
 
@@ -35,12 +50,12 @@ Controls: Arrow keys = D-pad, Z (or Y on QWERTZ)/X = A/B, Enter = Start, Space =
 |-----------|--------|
 | TLCS-870 CPU | Substantial subset ported from MAME (BSD-3-Clause, David Haywood). Direct opcodes + e0/e8/f0/ff prefix families implemented. |
 | NEC 78K/II CPU | Substantial subset of the µPD78214GC ISA per the 78K/II manual (opcode encoding cross-checked against MAME's `upd78k2d` disassembler — MAME has no execution core). |
-| CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support |
+| CD-ROM | CUE/BIN loading (single + multi-file), raw Mode 2/2352, ZIP support (miniz) |
 | BIOS HLE | Auto-scan for GLB/AJS, FMV playback loop |
 | Video decode | **AK8000 proprietary DCT codec** — 4×4 blocks, run/level VLC, DC prediction per macroblock (`src/ak8000_pd.c`) |
 | Audio decode | **XA ADPCM** with resampling to 44100 Hz |
-| Interactive | **F2 commands** — jumps, choices (F2 44), loops, quiz, timeout |
-| Display | SDL2, 320×240, 248×216 video centered |
+| Interactive | **F2 commands** — jumps, choices (F2 44/64), loops, quiz, timeout |
+| Display | SDL2 window, or a libretro core; 248×216 picture at 4:3 |
 | Pipeline | 10 sectors/frame @ 30fps (~4× CD speed) |
 
 ### Interactive FMV Commands
@@ -51,6 +66,7 @@ The Playdia uses F2 sectors with submode `0x09` for interactive control:
 |---------|----------|---------------|
 | F2 40 | Unconditional jump / scene loop | Forward=auto-seek, backward=loop until button |
 | F2 44 | Player choice (7 button destinations) | Wait for input, seek to chosen destination |
+| F2 64 | Timed jump with a player override | Seeks by itself; a button held right then takes its own slot |
 | F2 50 | Quiz answer verification | Wait for input, extra byte = correct/wrong flag |
 | F2 60 | Timed jump / animation | Auto-seek with duration parameter |
 | F2 80 | Timeout handler | Sets fallback destination for preceding F2 44 |
