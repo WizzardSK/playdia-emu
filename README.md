@@ -77,6 +77,10 @@ Button mapping: B1=Start/default, B2=Up, B3=Down, B4=Left, B5=Right, B6=A, B7=B
 
 MSF destination encoding: `target_LBA = M×4500 + S×75 + F − 150` (binary, not BCD)
 
+## License
+
+BSD 3-Clause — see [LICENSE](LICENSE), which also lists the parts that come from elsewhere and keep their own terms: the AK8000 decoder ported from [PlaydiaEmu](https://github.com/AloysHF/PlaydiaEmu) (BSD 3-Clause), the TLCS-870 core ported from MAME (BSD 3-Clause), miniz (MIT) and the libretro API header (MIT).
+
 ---
 
 # AK8000 Video Codec — Reverse-Engineered Specification
