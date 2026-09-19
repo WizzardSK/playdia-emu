@@ -1,10 +1,10 @@
 # Software Information
-display_name = "Bandai - Playdia (PlaydiaEmu)"
+display_name = "Playdia (playdia-emu)"
 authors = "WizzardSK"
 supported_extensions = "cue|bin|iso|zip"
-corename = "PlaydiaEmu"
+corename = "playdia-emu"
 categories = "Emulator"
-license = "GPLv3"
+license = "BSD-3-Clause"
 permissions = ""
 display_version = "0.1"
 

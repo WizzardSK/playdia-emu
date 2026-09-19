@@ -52,7 +52,7 @@ unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 void retro_get_system_info(struct retro_system_info *info)
 {
     memset(info, 0, sizeof(*info));
-    info->library_name     = "PlaydiaEmu";
+    info->library_name     = "playdia-emu";
     info->library_version  = "0.1";
     info->valid_extensions = "cue|bin|iso|zip";
     info->need_fullpath    = true;   // the disc is opened by the emulator itself
@@ -117,7 +117,7 @@ bool retro_load_game(const struct retro_game_info *game)
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
     {
-        log_cb(RETRO_LOG_ERROR, "PlaydiaEmu: XRGB8888 is required\n");
+        log_cb(RETRO_LOG_ERROR, "playdia-emu: XRGB8888 is required\n");
         return false;
     }
 
@@ -125,11 +125,11 @@ bool retro_load_game(const struct retro_game_info *game)
 
     if (playdia_load_disc(g_playdia, game->path) != 0)
     {
-        log_cb(RETRO_LOG_ERROR, "PlaydiaEmu: cannot load %s\n", game->path);
+        log_cb(RETRO_LOG_ERROR, "playdia-emu: cannot load %s\n", game->path);
         return false;
     }
 
-    log_cb(RETRO_LOG_INFO, "PlaydiaEmu: loaded %s\n", game->path);
+    log_cb(RETRO_LOG_INFO, "playdia-emu: loaded %s\n", game->path);
     return true;
 }
 
