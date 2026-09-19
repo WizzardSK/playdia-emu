@@ -4,7 +4,7 @@ SDL_LIBS    := $(shell sdl2-config --libs)
 FFMPEG_CFLAGS := $(shell pkg-config --cflags libavcodec libavutil libswscale)
 FFMPEG_LIBS   := $(shell pkg-config --libs   libavcodec libavutil libswscale)
 CFLAGS   = -Wall -Wextra -std=c11 -g -O2 -DPD_USE_FFMPEG -Isrc $(SDL_CFLAGS) $(FFMPEG_CFLAGS)
-LDFLAGS  = $(SDL_LIBS) $(FFMPEG_LIBS) -lzip -lm
+LDFLAGS  = $(SDL_LIBS) $(FFMPEG_LIBS) -lm
 TARGET   = playdia
 
 SRCS = src/main.c \
@@ -14,6 +14,7 @@ SRCS = src/main.c \
        src/ak8000.c \
        src/ak8000_pd.c \
        src/zip_stream.c \
+       src/miniz/miniz.c \
        src/interconnect.c \
        src/pipeline.c \
        src/bios_hle.c \
@@ -50,12 +51,13 @@ LIBRETRO_SRCS = src/playdia_libretro.c \
        src/ak8000.c \
        src/ak8000_pd.c \
        src/zip_stream.c \
+       src/miniz/miniz.c \
        src/interconnect.c \
        src/pipeline.c \
        src/bios_hle.c \
        src/playdia_sys.c
 LIBRETRO_CFLAGS = -Wall -Wextra -std=c11 -O2 -fPIC -Isrc
-LIBRETRO_LDFLAGS = -shared -lzip -lm
+LIBRETRO_LDFLAGS = -shared -lm
 
 libretro: $(LIBRETRO_TARGET)
 

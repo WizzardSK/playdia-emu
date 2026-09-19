@@ -1,5 +1,5 @@
 #include "zip_stream.h"
-#include <zip.h>
+#include "miniz/miniz.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>  // strcasecmp
@@ -8,26 +8,29 @@
 // ─────────────────────────────────────────────────────────────
 //  ZipStream internals
 //
-//  libzip's zip_file_t is forward-only (no seek). To support
-//  seeking we use two strategies:
+//  Reads a zip entry through miniz, which is vendored in src/miniz so the
+//  libretro core does not need libzip on every platform it is built for.
 //
-//  Small files (< ZIP_CACHE_THRESHOLD): cache entire entry in RAM,
-//  serve reads from cache → full random-access, minimal memory.
+//  miniz's extraction iterator is forward-only, like libzip's file handle
+//  was, so seeking works the same way as before:
 //
-//  Large files (CD images, typically 100-700 MB): we keep the
-//  zip_file_t open and simulate seeking by:
-//    - Forward seek: skip bytes by reading and discarding
-//    - Backward seek: reopen the zip_file_t from the start
+//  Small files (< ZIP_CACHE_THRESHOLD): cache the whole entry in RAM and
+//  serve reads from there → full random access, little memory.
 //
-//  For CD images backward seeks are rare (only during ISO parse
-//  at startup) so performance is acceptable.
+//  Large files (CD images, typically 100-700 MB): keep the iterator open
+//  and simulate seeking by
+//    - forward seek: read and discard
+//    - backward seek: restart the iterator from the beginning
+//
+//  For CD images backward seeks are rare (the ISO parse at startup), so
+//  that is fast enough.
 // ─────────────────────────────────────────────────────────────
 
 #define ZIP_CACHE_THRESHOLD  (4 * 1024 * 1024)  // 4 MB
 
 struct ZipStream {
-    zip_t      *za;          // zip archive handle
-    zip_file_t *zf;          // current file handle
+    mz_zip_archive  za;          // zip archive
+    mz_zip_reader_extract_iter_state *iter;  // current entry reader
     int         entry_index; // entry index inside archive
     char        entry_name[512];
     long        entry_size;  // uncompressed size in bytes
@@ -37,74 +40,95 @@ struct ZipStream {
     uint8_t    *cache;
     long        cache_size;
 
-    // Path to zip (needed to reopen zf on backward seek)
+    // Path to zip (kept for messages)
     char        zip_path[1024];
 };
 
-// Open a zip_file_t at entry_index positioned at byte 0
-static zip_file_t *open_entry(zip_t *za, int idx) {
-    return zip_fopen_index(za, (zip_uint64_t)idx, 0);
+static const char *za_error(mz_zip_archive *za)
+{
+    return mz_zip_get_error_string(mz_zip_get_last_error(za));
 }
 
-// Skip `n` bytes forward in zf by reading and discarding
-static int skip_forward(zip_file_t *zf, long n) {
+// Open an archive read-only, or NULL
+static int open_archive(mz_zip_archive *za, const char *path)
+{
+    mz_zip_zero_struct(za);
+
+    if (!mz_zip_reader_init_file(za, path, 0)) {
+        fprintf(stderr, "[ZIP] Cannot open %s: %s\n", path, za_error(za));
+        return -1;
+    }
+
+    return 0;
+}
+
+// Start reading entry idx from byte 0
+static mz_zip_reader_extract_iter_state *open_entry(mz_zip_archive *za, int idx)
+{
+    return mz_zip_reader_extract_iter_new(za, (mz_uint)idx, 0);
+}
+
+// Skip `n` bytes forward by reading and discarding
+static int skip_forward(mz_zip_reader_extract_iter_state *iter, long n)
+{
     char buf[4096];
     while (n > 0) {
-        long chunk = n < (long)sizeof buf ? n : (long)sizeof buf;
-        zip_int64_t got = zip_fread(zf, buf, (zip_uint64_t)chunk);
-        if (got <= 0) return -1;
-        n -= got;
+        size_t chunk = n < (long)sizeof buf ? (size_t)n : sizeof buf;
+        size_t got = mz_zip_reader_extract_iter_read(iter, buf, chunk);
+        if (got == 0) return -1;
+        n -= (long)got;
     }
     return 0;
 }
 
 ZipStream *zs_open_index(const char *zip_path, int entry_index) {
-    int err = 0;
-    zip_t *za = zip_open(zip_path, ZIP_RDONLY, &err);
-    if (!za) {
-        fprintf(stderr, "[ZIP] Cannot open %s (err %d)\n", zip_path, err);
-        return NULL;
-    }
-
-    zip_int64_t n_entries = zip_get_num_entries(za, 0);
-    if (entry_index < 0 || entry_index >= (int)n_entries) {
-        fprintf(stderr, "[ZIP] Entry index %d out of range (%lld entries)\n",
-                entry_index, (long long)n_entries);
-        zip_close(za);
-        return NULL;
-    }
-
-    zip_stat_t st;
-    if (zip_stat_index(za, (zip_uint64_t)entry_index, 0, &st) != 0) {
-        fprintf(stderr, "[ZIP] stat failed for entry %d\n", entry_index);
-        zip_close(za);
-        return NULL;
-    }
-
-    zip_file_t *zf = open_entry(za, entry_index);
-    if (!zf) {
-        fprintf(stderr, "[ZIP] Cannot open entry %d: %s\n",
-                entry_index, zip_strerror(za));
-        zip_close(za);
-        return NULL;
-    }
-
     ZipStream *zs = calloc(1, sizeof *zs);
-    zs->za          = za;
-    zs->zf          = zf;
+    if (!zs) return NULL;
+
+    if (open_archive(&zs->za, zip_path) != 0) {
+        free(zs);
+        return NULL;
+    }
+
+    const int n_entries = (int)mz_zip_reader_get_num_files(&zs->za);
+    if (entry_index < 0 || entry_index >= n_entries) {
+        fprintf(stderr, "[ZIP] Entry index %d out of range (%d entries)\n",
+                entry_index, n_entries);
+        mz_zip_reader_end(&zs->za);
+        free(zs);
+        return NULL;
+    }
+
+    mz_zip_archive_file_stat st;
+    if (!mz_zip_reader_file_stat(&zs->za, (mz_uint)entry_index, &st)) {
+        fprintf(stderr, "[ZIP] stat failed for entry %d: %s\n",
+                entry_index, za_error(&zs->za));
+        mz_zip_reader_end(&zs->za);
+        free(zs);
+        return NULL;
+    }
+
+    zs->iter = open_entry(&zs->za, entry_index);
+    if (!zs->iter) {
+        fprintf(stderr, "[ZIP] Cannot open entry %d: %s\n",
+                entry_index, za_error(&zs->za));
+        mz_zip_reader_end(&zs->za);
+        free(zs);
+        return NULL;
+    }
+
     zs->entry_index = entry_index;
-    zs->entry_size  = (long)st.size;
+    zs->entry_size  = (long)st.m_uncomp_size;
     zs->pos         = 0;
-    snprintf(zs->entry_name, sizeof zs->entry_name, "%s",
-             st.name ? st.name : "(unknown)");
+    snprintf(zs->entry_name, sizeof zs->entry_name, "%s", st.m_filename);
     snprintf(zs->zip_path, sizeof zs->zip_path, "%s", zip_path);
 
     // Cache small entries
     if (zs->entry_size <= ZIP_CACHE_THRESHOLD) {
         zs->cache = malloc((size_t)zs->entry_size);
         if (zs->cache) {
-            zip_int64_t got = zip_fread(zf, zs->cache,
-                                        (zip_uint64_t)zs->entry_size);
+            const size_t got = mz_zip_reader_extract_iter_read(
+                zs->iter, zs->cache, (size_t)zs->entry_size);
             zs->cache_size = (long)got;
         }
     }
@@ -117,28 +141,28 @@ ZipStream *zs_open_index(const char *zip_path, int entry_index) {
 }
 
 ZipStream *zs_open_suffix(const char *zip_path, const char *suffix) {
-    int err = 0;
-    zip_t *za = zip_open(zip_path, ZIP_RDONLY, &err);
-    if (!za) {
-        fprintf(stderr, "[ZIP] Cannot open %s\n", zip_path);
-        return NULL;
-    }
+    mz_zip_archive za;
 
-    int n = (int)zip_get_num_entries(za, 0);
+    if (open_archive(&za, zip_path) != 0)
+        return NULL;
+
+    const int n = (int)mz_zip_reader_get_num_files(&za);
+    const size_t suf_len = strlen(suffix);
     int best = -1;
-    size_t suf_len = strlen(suffix);
 
     for (int i = 0; i < n; i++) {
-        const char *name = zip_get_name(za, (zip_uint64_t)i, 0);
-        if (!name) continue;
-        size_t nl = strlen(name);
-        if (nl >= suf_len &&
-            strcasecmp(name + nl - suf_len, suffix) == 0) {
+        char name[512];
+        if (!mz_zip_reader_get_filename(&za, (mz_uint)i, name, sizeof name))
+            continue;
+
+        const size_t nl = strlen(name);
+        if (nl >= suf_len && strcasecmp(name + nl - suf_len, suffix) == 0) {
             best = i;
             break;
         }
     }
-    zip_close(za);
+
+    mz_zip_reader_end(&za);
 
     if (best < 0) {
         fprintf(stderr, "[ZIP] No entry with suffix \"%s\" in %s\n",
@@ -149,17 +173,22 @@ ZipStream *zs_open_suffix(const char *zip_path, const char *suffix) {
 }
 
 void zs_list(const char *zip_path) {
-    int err = 0;
-    zip_t *za = zip_open(zip_path, ZIP_RDONLY, &err);
-    if (!za) { fprintf(stderr, "[ZIP] Cannot open %s\n", zip_path); return; }
-    int n = (int)zip_get_num_entries(za, 0);
+    mz_zip_archive za;
+
+    if (open_archive(&za, zip_path) != 0)
+        return;
+
+    const int n = (int)mz_zip_reader_get_num_files(&za);
     printf("[ZIP] %s — %d entries:\n", zip_path, n);
+
     for (int i = 0; i < n; i++) {
-        zip_stat_t st; zip_stat_index(za, (zip_uint64_t)i, 0, &st);
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&za, (mz_uint)i, &st)) continue;
         printf("  [%2d] %-40s  %7ld KB\n",
-               i, st.name ? st.name : "?", (long)st.size/1024);
+               i, st.m_filename, (long)(st.m_uncomp_size / 1024));
     }
-    zip_close(za);
+
+    mz_zip_reader_end(&za);
 }
 
 const char *zs_name(ZipStream *zs) { return zs->entry_name; }
@@ -177,9 +206,9 @@ size_t zs_read(ZipStream *zs, void *buf, size_t n) {
         return n;
     }
 
-    zip_int64_t got = zip_fread(zs->zf, buf, (zip_uint64_t)n);
-    if (got > 0) zs->pos += (long)got;
-    return got > 0 ? (size_t)got : 0;
+    const size_t got = mz_zip_reader_extract_iter_read(zs->iter, buf, n);
+    zs->pos += (long)got;
+    return got;
 }
 
 int zs_seek(ZipStream *zs, long offset, int whence) {
@@ -198,25 +227,25 @@ int zs_seek(ZipStream *zs, long offset, int whence) {
 
     // Streaming: forward seek = skip bytes
     if (new_pos >= zs->pos) {
-        if (skip_forward(zs->zf, new_pos - zs->pos) != 0) return -1;
+        if (skip_forward(zs->iter, new_pos - zs->pos) != 0) return -1;
         zs->pos = new_pos;
         return 0;
     }
 
-    // Backward seek: reopen entry from start, then skip forward
-    zip_fclose(zs->zf);
-    zs->zf = open_entry(zs->za, zs->entry_index);
-    if (!zs->zf) return -1;
+    // Backward seek: restart the entry, then skip forward
+    mz_zip_reader_extract_iter_free(zs->iter);
+    zs->iter = open_entry(&zs->za, zs->entry_index);
+    if (!zs->iter) return -1;
     zs->pos = 0;
-    if (new_pos > 0 && skip_forward(zs->zf, new_pos) != 0) return -1;
+    if (new_pos > 0 && skip_forward(zs->iter, new_pos) != 0) return -1;
     zs->pos = new_pos;
     return 0;
 }
 
 void zs_close(ZipStream *zs) {
     if (!zs) return;
-    if (zs->zf)    zip_fclose(zs->zf);
-    if (zs->za)    zip_close(zs->za);
-    if (zs->cache) free(zs->cache);
+    if (zs->iter) mz_zip_reader_extract_iter_free(zs->iter);
+    mz_zip_reader_end(&zs->za);
+    free(zs->cache);
     free(zs);
 }
