@@ -27,7 +27,7 @@ Dependencies: SDL2, libavcodec, libavutil, libswscale, libzip
 ./playdia --test                # CPU self-test
 ```
 
-Controls: Arrow keys = D-pad, Z/X = A/B, Enter = Start, Space = Select, F1 = Fullscreen, Esc = Quit
+Controls: Arrow keys = D-pad, Z (or Y on QWERTZ)/X = A/B, Enter = Start, Space = Select, F1 = Fullscreen, Esc = Quit
 
 ## Emulator Status
 

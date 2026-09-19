@@ -158,7 +158,10 @@ uint8_t sdl_key_to_btn(SDL_Keycode k) {
         case SDLK_RIGHT:  return BTN_RIGHT;
         case SDLK_UP:     return BTN_UP;
         case SDLK_DOWN:   return BTN_DOWN;
-        case SDLK_z:      return BTN_A;
+        // Y as well as Z: on QWERTZ layouts the key where QWERTY has Z
+        // sits under Y, so both have to reach the A button.
+        case SDLK_z:
+        case SDLK_y:      return BTN_A;
         case SDLK_x:      return BTN_B;
         case SDLK_RETURN: return BTN_START;
         case SDLK_SPACE:  return BTN_SELECT;

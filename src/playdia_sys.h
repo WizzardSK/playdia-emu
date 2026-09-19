@@ -27,6 +27,7 @@ typedef struct Playdia {
 
     // ── Controller (infrared) ──────────────────────────────
     uint8_t      controller;         // button state bitmask
+    uint8_t      controller_latch;   // press remembered while a scene loop runs
 
     // ── Timing ─────────────────────────────────────────────
     uint64_t     master_cycles;

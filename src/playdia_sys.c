@@ -32,6 +32,7 @@ void playdia_reset(Playdia *p) {
     ak8000_reset     (&p->video);
 
     p->controller    = 0;
+    p->controller_latch = 0;
     p->master_cycles = 0;
     p->frames        = 0;
     p->running       = true;
@@ -145,8 +146,14 @@ static void playdia_handle_interactive(Playdia *p) {
     uint8_t btn = p->controller;
 
     // ── F2 40 loop: button press breaks out ──────────────────
+    //
+    //  The loop command is only pending for the one frame in which its
+    //  sector is parsed, and a pass takes several hundred frames, so a
+    //  press is checked against the latch too: anything pressed during
+    //  the loop still breaks out when the command comes round again.
     if (v->is_loop && v->interactive_cmd == 0x40) {
-        if (btn) {
+        if (btn || p->controller_latch) {
+            p->controller_latch = 0;
             // Any button breaks the loop — continue streaming past the F2 40
             v->seek_target = 0;
             v->interactive_pending = false;
@@ -228,6 +235,13 @@ void playdia_run_frame(Playdia *p) {
     }
 
     // ── Handle interactive FMV commands ─────────────────────
+    //  A scene loop only looks at the controller in the one frame its F2
+    //  40 sector is parsed, and a pass runs for hundreds of frames, so a
+    //  press is remembered until the loop command comes round. A question
+    //  on screen is polled every frame instead and must get a fresh press,
+    //  so the latch is held clear while one is waiting.
+    if (p->video.waiting_for_input) p->controller_latch  = 0;
+    else                            p->controller_latch |= p->controller;
     playdia_handle_interactive(p);
 
     // End-of-frame: feed CD sectors → AK8000 via pipeline
