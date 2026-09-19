@@ -34,6 +34,10 @@
 #include <string.h>
 #include <stdio.h>
 
+/* PSW bit helpers, defined further down but used by the BIT group below. */
+int  cpu_extract_psw_bit(CPU_NEC78K *c, int b);
+void cpu_inject_psw_bit (CPU_NEC78K *c, int b, int val);
+
 /* ── memory helpers ─────────────────────────────────────── */
 static inline uint8_t  m8 (CPU_NEC78K *c, uint16_t a) { return c->mem[a]; }
 static inline uint16_t m16(CPU_NEC78K *c, uint16_t a) {
@@ -833,8 +837,6 @@ static int decode_02_03(CPU_NEC78K *c, uint8_t op1) {
 }
 
 /* helpers used by decode_02_03 — extract/inject PSW bit by index */
-int cpu_extract_psw_bit(CPU_NEC78K *c, int b);
-void cpu_inject_psw_bit(CPU_NEC78K *c, int b, int val);
 int cpu_extract_psw_bit(CPU_NEC78K *c, int b) {
     static const uint8_t bit_mask[8] = { NEC_CY, NEC_ISP, 0x04, NEC_RBS0, NEC_AC, NEC_RBS1, NEC_Z, NEC_IE };
     return (c->PSW & bit_mask[b & 7]) != 0;
