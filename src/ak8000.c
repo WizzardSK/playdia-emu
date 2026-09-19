@@ -1,4 +1,5 @@
 #include "ak8000.h"
+#include "ak8000_pd.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -1032,318 +1033,38 @@ static int pd_decode_one_frame(pd_bitstream *bs, int coeff[PD_NBLOCKS][64],
 }
 
 static void playdia_decode_video_frame(AK8000 *v) {
-    if (v->vid_frame_pos < 40) return;
+    static uint8_t picture[PD_PIC_W * PD_PIC_H * 3];
 
-    const uint8_t *f = v->vid_frame_buf;
-    const CodecParams *cp = &v->codec_params;
-
-    // Select zigzag table
-    switch (cp->zigzag_alt) {
-    case 1:  pd_zigzag = pd_zigzag_alt; break;
-    case 2:  pd_zigzag = pd_zigzag_raster; break;
-    default: pd_zigzag = pd_zigzag_standard; break;
+    pd_result r = pd_picture_decode(v->vid_frame_buf, (size_t)v->vid_frame_pos, picture);
+    if (r.status != PD_OK) {
+        // An invalid picture leaves the previous frame on screen, as the
+        // hardware does; log the first few so bad streams stay visible.
+        static int reported;
+        if (reported < 8) {
+            reported++;
+            printf("[VID] picture rejected: %s at bit %d (row %d, block %d), %d bytes\n",
+                   pd_status_name(r.status), r.bit, r.row, r.block, v->vid_frame_pos);
+        }
+        return;
     }
 
-    // Validate header
-    if (f[0] != 0x00 || f[1] != 0x80 || f[2] != 0x04) return;
+    // Keep the header fields the rest of the emulator reports on.
+    v->qscale = v->vid_frame_buf[3];
+    memcpy(v->qtable, v->vid_frame_buf + 4, 16);
 
-    uint8_t qscale = f[3];
-    memcpy(v->qtable, f + 4, 16);
-    v->qscale = qscale;
+    if (v->fq_count >= PD_FRAME_QUEUE_SIZE) return;
 
-    // Dump qtable once
-    static bool qtable_dumped = false;
-    if (!qtable_dumped) {
-        printf("[VID] QTable 4x4:");
-        for (int i = 0; i < 16; i++) printf(" %d", v->qtable[i]);
-        printf("\n[VID] Bytes 20-39:");
-        for (int i = 20; i < 40; i++) printf(" %02X", f[i]);
-        printf("\n");
-        qtable_dumped = true;
-    }
+    uint8_t *dst = v->frame_queue[v->fq_write];
+    memset(dst, 0, SCREEN_W * SCREEN_H * 3);
+    const int ox = (SCREEN_W - PD_PIC_W) / 2;
+    const int oy = (SCREEN_H - PD_PIC_H) / 2;
+    for (int y = 0; y < PD_PIC_H; y++)
+        memcpy(dst + (((y + oy) * SCREEN_W) + ox) * 3,
+               picture + (size_t)y * PD_PIC_W * 3, PD_PIC_W * 3);
 
-    // Find actual data end (strip 0xFF padding)
-    int data_end = v->vid_frame_pos;
-    while (data_end > 40 && f[data_end - 1] == 0xFF) data_end--;
-    int total_bits = (data_end - 40) * 8;
-
-    // Bytes 40-42: DC predictor init values (Y, Cb, Cr)
-    int dc_init_y  = (int)f[40];
-    int dc_init_cb = (int)f[41];
-    int dc_init_cr = (int)f[42];
-    printf("[VID] DC init: Y=%d Cb=%d Cr=%d  byte43=%02X  QS=%d\n",
-           dc_init_y, dc_init_cb, dc_init_cr, f[43], qscale);
-
-    // Bitstream starts at configurable offset
-    int bso = cp->bs_offset;
-    if (bso >= data_end) return;
-    int bs_total = (data_end - bso) * 8;
-    pd_bitstream bs = { f + bso, bs_total, 0 };
-
-    // Use tunable dimensions
-    int pw = cp->width;
-    int ph = cp->height;
-    int pmw = pw / 16;
-    int pmh = ph / 16;
-    if (pmw < 1) pmw = 1;
-    if (pmh < 1) pmh = 1;
-
-    // Coefficient storage for current frame
-    static int frame_coeff[PD_NBLOCKS][64];
-
-    // Dynamic plane buffers (stack-allocated, max 320x240)
-    uint8_t Y[240][320];
-    uint8_t Cb[120][160];
-    uint8_t Cr[120][160];
-
-    int frames_decoded = 0;
-
-    while (bs.pos < total_bits - 64) {
-        int nblocks = pd_decode_one_frame(&bs, frame_coeff,
-                                          qscale, v->qtable,
-                                          dc_init_y, dc_init_cb, dc_init_cr,
-                                          cp);
-        if (nblocks < 6) break;
-
-        // IDCT + render to Y/Cb/Cr planes
-        memset(Y, 128 + cp->level_shift, sizeof(Y));
-        memset(Cb, 128, sizeof(Cb));
-        memset(Cr, 128, sizeof(Cr));
-
-        // Build macroblock scan order lookup table
-        int nmb = pmw * pmh;
-        int mb_scan_x[256], mb_scan_y[256]; // max 16x16 MBs
-        for (int m = 0; m < nmb && m < 256; m++) {
-            int sx, sy;
-            switch (cp->scan_order) {
-            default:
-            case 0: // row-major (standard)
-                sx = m % pmw; sy = m / pmw; break;
-            case 1: // column-major
-                sx = m / pmh; sy = m % pmh; break;
-            case 2: { // zigzag (alternating row direction)
-                sy = m / pmw; sx = m % pmw;
-                if (sy & 1) sx = pmw - 1 - sx; // reverse odd rows
-                break;
-            }
-            case 3: { // boustrophedon (snake)
-                sy = m / pmw; sx = m % pmw;
-                if (sy & 1) sx = pmw - 1 - sx;
-                break;
-            }
-            case 4: { // interleaved: even MBs first, then odd
-                int half = nmb / 2;
-                if (m < half) { int mm = m * 2; sx = mm % pmw; sy = mm / pmw; }
-                else { int mm = (m - half) * 2 + 1; sx = mm % pmw; sy = mm / pmw; }
-                break;
-            }
-            case 5: // reverse row-major
-                sx = (nmb - 1 - m) % pmw; sy = (nmb - 1 - m) / pmw; break;
-            case 6: { // row-major but starting from bottom
-                int rm = (pmh - 1 - m / pmw) * pmw + m % pmw;
-                sx = rm % pmw; sy = rm / pmw; break;
-            }
-            }
-            mb_scan_x[m] = sx;
-            mb_scan_y[m] = sy;
-        }
-
-        // Y block order within macroblock (4 blocks)
-        // Each entry: (dx, dy) offset in 8-pixel units within 16x16 MB
-        static const int blk_orders[4][4][2] = {
-            {{0,0},{1,0},{0,1},{1,1}},  // 0: Z-pattern (standard MPEG)
-            {{0,0},{0,1},{1,0},{1,1}},  // 1: N-pattern (column-first)
-            {{0,0},{1,0},{1,1},{0,1}},  // 2: U-pattern
-            {{0,0},{0,1},{1,1},{1,0}},  // 3: reverse-Z
-        };
-        int bord = cp->block_order;
-        if (bord < 0 || bord > 3) bord = 0;
-
-        int mbpx = cp->mb_size ? 8 : 16;
-        int bpm;
-        if (cp->mb_size) { bpm = 1; }
-        else {
-            switch (cp->chroma_mode) {
-            case 0: bpm = 6; break; case 1: bpm = 8; break;
-            case 2: bpm = 6; break; case 3: bpm = 4; break;
-            default: bpm = 6; break;
-            }
-        }
-
-        // Plane-interleaved block counts
-        int plane_total_y  = pmw * pmh * 4;
-        int plane_total_cb = pmw * pmh;
-        int yw = pw / 8, yh = ph / 8;  // Y blocks grid for plane mode
-        int cw = pw / 16, ch = ph / 16; // chroma blocks grid
-
-        for (int i = 0; i < nblocks; i++) {
-            uint8_t block[8][8];
-            pd_idct_block(frame_coeff[i], block);
-
-            if (cp->level_shift != 0) {
-                for (int r = 0; r < 8; r++)
-                    for (int c = 0; c < 8; c++)
-                        block[r][c] = (uint8_t)pd_clamp((int)block[r][c] + cp->level_shift);
-            }
-
-            if (cp->interleave == 1) {
-                // Plane mode: blocks 0..total_y-1 = Y raster, then Cb, then Cr
-                if (i < plane_total_y) {
-                    int bi = i;
-                    int bx = (bi % yw) * 8;
-                    int by = (bi / yw) * 8;
-                    for (int r = 0; r < 8; r++)
-                        for (int c = 0; c < 8; c++)
-                            if (by + r < ph && bx + c < pw)
-                                Y[by + r][bx + c] = block[r][c];
-                } else if (i < plane_total_y + plane_total_cb) {
-                    int bi = i - plane_total_y;
-                    int bx = (bi % cw) * 8;
-                    int by = (bi / cw) * 8;
-                    for (int r = 0; r < 8; r++)
-                        for (int c = 0; c < 8; c++)
-                            if (by + r < ph / 2 && bx + c < pw / 2)
-                                Cb[by + r][bx + c] = block[r][c];
-                } else {
-                    int bi = i - plane_total_y - plane_total_cb;
-                    int bx = (bi % cw) * 8;
-                    int by = (bi / cw) * 8;
-                    for (int r = 0; r < 8; r++)
-                        for (int c = 0; c < 8; c++)
-                            if (by + r < ph / 2 && bx + c < pw / 2)
-                                Cr[by + r][bx + c] = block[r][c];
-                }
-            } else if (cp->interleave == 2) {
-                // Y-only raster: all blocks are Y
-                int bx = (i % yw) * 8;
-                int by = (i / yw) * 8;
-                for (int r = 0; r < 8; r++)
-                    for (int c = 0; c < 8; c++)
-                        if (by + r < ph && bx + c < pw)
-                            Y[by + r][bx + c] = block[r][c];
-            } else {
-                // MB-interleaved (standard)
-                int mb = i / bpm, bl = i % bpm;
-                if (mb >= nmb || mb >= 256) break;
-                int mx = mb_scan_x[mb], my = mb_scan_y[mb];
-
-                if (cp->mb_size) {
-                    int bx = mx * 8, by = my * 8;
-                    for (int r = 0; r < 8; r++)
-                        for (int c = 0; c < 8; c++)
-                            if (by + r < ph && bx + c < pw)
-                                Y[by + r][bx + c] = block[r][c];
-                } else if (bl < 4) {
-                    int bx = mx * 16 + blk_orders[bord][bl][0] * 8;
-                    int by = my * 16 + blk_orders[bord][bl][1] * 8;
-                    for (int r = 0; r < 8; r++)
-                        for (int c = 0; c < 8; c++)
-                            if (by + r < ph && bx + c < pw)
-                                Y[by + r][bx + c] = block[r][c];
-                } else if (bl == 4) {
-                    for (int r = 0; r < 8; r++)
-                        for (int c = 0; c < 8; c++)
-                            if (my * 8 + r < ph / 2 && mx * 8 + c < pw / 2)
-                                Cb[my * 8 + r][mx * 8 + c] = block[r][c];
-                } else {
-                    for (int r = 0; r < 8; r++)
-                        for (int c = 0; c < 8; c++)
-                            if (my * 8 + r < ph / 2 && mx * 8 + c < pw / 2)
-                                Cr[my * 8 + r][mx * 8 + c] = block[r][c];
-                }
-            }
-        }
-
-        // Debug: save Y/Cb/Cr planes for first frame per packet
-        static int y_save_count = 0;
-        if (frames_decoded == 0 && y_save_count < 3) {
-            int sn = y_save_count;
-            char _yname[64]; snprintf(_yname, sizeof _yname, "/tmp/pd_y_%02d.pgm", sn);
-            FILE *yf = fopen(_yname, "wb");
-            if (yf) {
-                fprintf(yf, "P5\n%d %d\n255\n", pw, ph);
-                for (int yy = 0; yy < ph; yy++)
-                    fwrite(Y[yy], 1, pw, yf);
-                fclose(yf);
-            }
-            // Save Cb and Cr planes too
-            char _cbname[64]; snprintf(_cbname, sizeof _cbname, "/tmp/pd_cb_%02d.pgm", sn);
-            FILE *cbf = fopen(_cbname, "wb");
-            if (cbf) {
-                fprintf(cbf, "P5\n%d %d\n255\n", pw/2, ph/2);
-                for (int yy = 0; yy < ph/2; yy++)
-                    fwrite(Cb[yy], 1, pw/2, cbf);
-                fclose(cbf);
-            }
-            char _crname[64]; snprintf(_crname, sizeof _crname, "/tmp/pd_cr_%02d.pgm", sn);
-            FILE *crf = fopen(_crname, "wb");
-            if (crf) {
-                fprintf(crf, "P5\n%d %d\n255\n", pw/2, ph/2);
-                for (int yy = 0; yy < ph/2; yy++)
-                    fwrite(Cr[yy], 1, pw/2, crf);
-                fclose(crf);
-            }
-        }
-        if (frames_decoded == 0) y_save_count++;
-
-        // YCbCr 4:2:0 → RGB888 into frame queue (centered in 320×240)
-        if (v->fq_count < PD_FRAME_QUEUE_SIZE) {
-            uint8_t *dst_buf = v->frame_queue[v->fq_write];
-            int ox = (SCREEN_W - pw) / 2;
-            int oy = (SCREEN_H - ph) / 2;
-            memset(dst_buf, 0, SCREEN_W * SCREEN_H * 3);
-
-            for (int y = 0; y < ph; y++) {
-                for (int x = 0; x < pw; x++) {
-                    int yv = Y[y][x];
-                    int cb = Cb[y / 2][x / 2] - 128;
-                    int cr = Cr[y / 2][x / 2] - 128;
-                    int dst = ((y + oy) * SCREEN_W + (x + ox)) * 3;
-                    if (y + oy >= 0 && y + oy < SCREEN_H && x + ox >= 0 && x + ox < SCREEN_W) {
-                        dst_buf[dst + 0] = (uint8_t)pd_clamp(yv + (int)(1.402 * cr));
-                        dst_buf[dst + 1] = (uint8_t)pd_clamp(yv - (int)(0.344 * cb + 0.714 * cr));
-                        dst_buf[dst + 2] = (uint8_t)pd_clamp(yv + (int)(1.772 * cb));
-                    }
-                }
-            }
-
-            // Grid overlay
-            if (cp->grid_overlay) {
-                for (int y = 0; y < ph; y++) {
-                    for (int x = 0; x < pw; x++) {
-                        bool draw = false;
-                        if ((cp->grid_overlay & 1) && (x % 8 == 0 || y % 8 == 0))
-                            draw = true;  // 8x8 block grid
-                        if ((cp->grid_overlay & 2) && (x % 16 == 0 || y % 16 == 0))
-                            draw = true;  // MB grid
-                        if (draw) {
-                            int di = ((y + oy) * SCREEN_W + (x + ox)) * 3;
-                            if (y + oy >= 0 && y + oy < SCREEN_H && x + ox >= 0 && x + ox < SCREEN_W) {
-                                // Red for MB, green for block
-                                bool mb_line = (x % 16 == 0 || y % 16 == 0);
-                                dst_buf[di + 0] = mb_line ? 255 : 0;
-                                dst_buf[di + 1] = mb_line ? 0 : 255;
-                                dst_buf[di + 2] = 0;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Bitstream stats overlay (bottom of image)
-            if (frames_decoded == 0) {
-                int pct = (bs.pos * 100) / (bs_total > 0 ? bs_total : 1);
-                printf("[VID] Bitstream: %d/%d bits used (%d%%), %d blocks decoded\n",
-                       bs.pos, bs_total, pct, nblocks);
-            }
-
-            v->fq_write = (v->fq_write + 1) % PD_FRAME_QUEUE_SIZE;
-            v->fq_count++;
-        }
-
-        v->frame_count++;
-        frames_decoded++;
-    }
+    v->fq_write = (v->fq_write + 1) % PD_FRAME_QUEUE_SIZE;
+    v->fq_count++;
+    v->frame_count++;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1673,18 +1394,31 @@ void ak8000_feed_xa_sector(AK8000 *v, const uint8_t *raw_sector) {
                 ak8000_parse_f2_command(v, payload, cur_lba);
             } else {
                 // ── Regular frame-end marker (submode 0x08) ──────
-                if (v->vid_frame_pos >= 6 * 2047 &&
+                // The F2 sector carries the tail of the picture from
+                // byte 0x23 on; append it before decoding.
+                if (v->vid_frame_pos > 0) {
+                    int tail = 2048 - 0x23;
+                    if (v->vid_frame_pos + tail <= (int)sizeof(v->vid_frame_buf)) {
+                        memcpy(v->vid_frame_buf + v->vid_frame_pos, payload + 0x23, tail);
+                        v->vid_frame_pos += tail;
+                    }
+                }
+                if (v->vid_frame_pos >= PD_HEADER_BYTES + 8 &&
                     v->vid_frame_buf[0] == 0x00 &&
                     v->vid_frame_buf[1] == 0x80 &&
                     v->vid_frame_buf[2] == 0x04) {
-                    // Use all accumulated F1 data (6-13 sectors typical)
                     playdia_decode_video_frame(v);
                 }
                 v->vid_frame_pos = 0;
             }
         } else if (marker == 0xF3) {
-            // Scene marker — reset frame accumulator
-            v->vid_frame_pos = 0;
+            // F3 filler (two bytes then 0xFF padding) is not a scene change;
+            // only a real F3 marker drops the partial picture.
+            int padding = 1;
+            for (int i = 3; i < 2048; i++) {
+                if (payload[i] != 0xFF) { padding = 0; break; }
+            }
+            if (!padding) v->vid_frame_pos = 0;
         }
     }
 }
