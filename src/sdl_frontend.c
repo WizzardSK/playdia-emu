@@ -1,6 +1,7 @@
 #include "sdl_frontend.h"
 #include "playdia_sys.h"
 #include "ak8000.h"
+#include "ak8000_pd.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -117,14 +118,13 @@ bool sdl_present_frame(SDLFrontend *fe, const uint8_t *rgb888, int w, int h) {
 
     SDL_RenderClear(fe->renderer);
 
-    // Stretch the centered 192×144 video region to fill the entire
-    // window, no black borders.  Source rect picks just the active
-    // video area inside the 320×240 framebuffer.
-    int vid_w = 192;
-    int vid_h = 144;
-    int ox    = (SCREEN_W - vid_w) / 2;
-    int oy    = (SCREEN_H - vid_h) / 2;
-    SDL_Rect src = { ox, oy, vid_w, vid_h };
+    // Stretch the centered picture to fill the entire window, no black
+    // borders. The source rect is the active video area inside the
+    // 320×240 framebuffer, which is where ak8000.c blits the decoded
+    // PD_PIC_W × PD_PIC_H picture.
+    int ox = (SCREEN_W - PD_PIC_W) / 2;
+    int oy = (SCREEN_H - PD_PIC_H) / 2;
+    SDL_Rect src = { ox, oy, PD_PIC_W, PD_PIC_H };
     SDL_RenderCopy(fe->renderer, fe->texture, &src, NULL);
 
     SDL_RenderPresent(fe->renderer);
