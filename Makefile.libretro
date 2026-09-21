@@ -9,7 +9,7 @@
 #  make -f Makefile.libretro platform=unix
 # ─────────────────────────────────────────────────────────────
 
-TARGET_NAME := playdia
+TARGET_NAME := playem
 
 ifeq ($(platform),)
 	platform = unix
@@ -24,7 +24,7 @@ endif
 
 CORE_DIR := .
 SOURCES_C := \
-	$(CORE_DIR)/src/playdia_libretro.c \
+	$(CORE_DIR)/src/playem_libretro.c \
 	$(CORE_DIR)/src/cpu_tlcs870.c \
 	$(CORE_DIR)/src/cpu_nec78k.c \
 	$(CORE_DIR)/src/cdrom.c \

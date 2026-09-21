@@ -6,7 +6,7 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE    := retro
 LOCAL_SRC_FILES := \
-	$(CORE_DIR)/playdia_libretro.c \
+	$(CORE_DIR)/playem_libretro.c \
 	$(CORE_DIR)/cpu_tlcs870.c \
 	$(CORE_DIR)/cpu_nec78k.c \
 	$(CORE_DIR)/cdrom.c \

@@ -7,7 +7,7 @@
 # Core definitions
 .core-defs:
   variables:
-    CORENAME: playdia
+    CORENAME: playem
     MAKEFILE: Makefile.libretro
 
 # Inclusion templates, required for the build to work

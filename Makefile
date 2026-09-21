@@ -5,7 +5,7 @@ FFMPEG_CFLAGS := $(shell pkg-config --cflags libavcodec libavutil libswscale)
 FFMPEG_LIBS   := $(shell pkg-config --libs   libavcodec libavutil libswscale)
 CFLAGS   = -Wall -Wextra -std=c11 -g -O2 -DPD_USE_FFMPEG -Isrc $(SDL_CFLAGS) $(FFMPEG_CFLAGS)
 LDFLAGS  = $(SDL_LIBS) $(FFMPEG_LIBS) -lm
-TARGET   = playdia
+TARGET   = playem
 
 SRCS = src/main.c \
        src/cpu_tlcs870.c \

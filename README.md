@@ -28,10 +28,10 @@ make -f Makefile.libretro platform=unix        # also osx, ios, android, emscrip
 ## Running
 
 ```bash
-./playdia game.cue              # Run with SDL2 window
-./playdia game.cue --headless   # Run without display (600 frames)
-./playdia game.cue --debug      # Run with per-second stats
-./playdia --test                # CPU self-test
+./playem game.cue              # Run with SDL2 window
+./playem game.cue --headless   # Run without display (600 frames)
+./playem game.cue --debug      # Run with per-second stats
+./playem --test                # CPU self-test
 ```
 
 Controls: Arrow keys = D-pad, Z (or Y on QWERTZ)/X = A/B, Enter = Start, Space = Select, F1 = Fullscreen, Esc = Quit
@@ -40,7 +40,7 @@ In the libretro core the same buttons are the RetroPad's D-pad, A, B, Start and 
 
 ## libretro core
 
-`playdia_libretro.so` hands the frontend the 248×216 picture at 4:3, 30 fps and 44100 Hz, and takes `.cue`, `.bin`, `.iso` and Redump `.zip` by path. It sets `need_fullpath`, so it opens the disc itself; a path the C library cannot resolve - an Android SAF `content://` URI - goes through the frontend's VFS instead, wrapped back into a `FILE*` (`src/vfs_file.c`).
+`playem_libretro.so` hands the frontend the 248×216 picture at 4:3, 30 fps and 44100 Hz, and takes `.cue`, `.bin`, `.iso` and Redump `.zip` by path. It sets `need_fullpath`, so it opens the disc itself; a path the C library cannot resolve - an Android SAF `content://` URI - goes through the frontend's VFS instead, wrapped back into a `FILE*` (`src/vfs_file.c`).
 
 Save states are not implemented: the emulator has no serialiser yet, so rewind, run-ahead and netplay are out until it grows one.
 
