@@ -7,7 +7,7 @@
 #include <time.h>
 
 // ─────────────────────────────────────────────────────────────
-//  Playdia Emulator - Main Entry Point
+//  PlayEm - Main Entry Point
 //
 //  Usage:
 //    ./playdia game.iso            <- run a disc
@@ -18,7 +18,7 @@
 
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════╗\n");
-    printf("║   Playdia Emulator  v0.2                         ║\n");
+    printf("║   PlayEm  v0.2                                   ║\n");
     printf("║   Bandai Playdia Quick Interactive System (1994) ║\n");
     printf("║   Main: Toshiba TLCS-870 @ 8MHz                  ║\n");
     printf("║   I/O:  NEC µPD78214 (78K/II) @ 12MHz            ║\n");
@@ -170,7 +170,7 @@ int main(int argc, char *argv[]) {
 
     // ── SDL2 mode ─────────────────────────────────────────
     SDLFrontend fe;
-    if (sdl_init(&fe, "Playdia Emulator") != 0) {
+    if (sdl_init(&fe, "PlayEm") != 0) {
         fprintf(stderr, "[Main] SDL init failed — falling back to headless\n");
         run_headless(playdia, 300);
         free(playdia);

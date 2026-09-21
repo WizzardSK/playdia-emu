@@ -1,6 +1,6 @@
-# Playdia Emulator
+# PlayEm
 
-Emulator for the **Bandai Playdia** (1994), an obscure Japanese FMV console.
+PlayEm is an emulator for the **Bandai Playdia** (1994), an obscure Japanese FMV console.
 
 ## Hardware
 - **Console**: Bandai Playdia Quick Interactive System (1994)

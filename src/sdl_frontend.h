@@ -5,7 +5,7 @@
 #include <stdbool.h>
 
 // ─────────────────────────────────────────────────────────────
-//  SDL2 Frontend for Playdia Emulator
+//  SDL2 Frontend for PlayEm
 //  - 320×240 window (×2 scale = 640×480)
 //  - 44100Hz stereo audio callback
 //  - Keyboard → controller mapping

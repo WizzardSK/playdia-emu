@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────
-//  libretro front end for the Playdia emulator.
+//  libretro front end for PlayEm.
 //
 //  The emulator core is already frontend-agnostic: playdia_run_frame()
 //  advances one 30 Hz frame, the decoded picture lands in the AK8000

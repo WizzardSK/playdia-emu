@@ -1,8 +1,8 @@
 # Software Information
-display_name = "Playdia (playdia-emu)"
+display_name = "Playdia (PlayEm)"
 authors = "WizzardSK"
 supported_extensions = "cue|bin|iso|zip"
-corename = "playdia-emu"
+corename = "PlayEm"
 categories = "Emulator"
 license = "BSD-3-Clause"
 permissions = ""
